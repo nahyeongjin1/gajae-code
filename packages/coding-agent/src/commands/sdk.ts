@@ -374,6 +374,7 @@ export async function runSessionHost(
 				sessionManager: opened.sessionManager,
 				...(mcpConfigPath ? { mcpConfigPath } : {}),
 				...(mcpStartupTimeoutMs !== undefined ? { mcpStartupTimeoutMs } : {}),
+				...(request.readiness ? { readiness: request.readiness } : {}),
 			});
 		} catch (error) {
 			throw await registrationFailure(error);

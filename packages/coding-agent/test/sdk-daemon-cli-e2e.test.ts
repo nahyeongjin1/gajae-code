@@ -4,7 +4,9 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
 import { Broker } from "../src/sdk/broker/broker";
+import { OwnedChildren, settleFixtureBrokerWithOwner } from "./helpers/owned-children";
 
+const cliChildren = new OwnedChildren();
 const cliEntrypoint = path.resolve(import.meta.dir, "../src/cli.ts");
 
 type CliResult = { exitCode: number; stdout: string; stderr: string };
@@ -29,13 +31,18 @@ async function runCli(repo: string, agentDir: string, args: string[]): Promise<C
 	const stderrPath = path.join(captureDir, "stderr");
 	const stdoutFd = openSync(stdoutPath, "w");
 	const stderrFd = openSync(stderrPath, "w");
-	try {
-		const child = Bun.spawn([process.execPath, "run", cliEntrypoint, "daemon", "session", ...args], {
+	// Owned before the first await: a CLI child that outlives its capture read —
+	// or a test that times out mid-run — is settled through this handle in the
+	// suite's own teardown instead of surviving as a `gjc-sdk-cli-*` orphan.
+	const child = cliChildren.track(
+		Bun.spawn([process.execPath, "run", cliEntrypoint, "daemon", "session", ...args], {
 			cwd: repo,
 			env: { ...process.env, GJC_CODING_AGENT_DIR: agentDir },
 			stdout: stdoutFd,
 			stderr: stderrFd,
-		});
+		}),
+	);
+	try {
 		const exitCode = await child.exited;
 		// Close before reading so file contents are durable even if Bun still
 		// held a write handle; tolerate already-closed FDs from the child.
@@ -134,9 +141,32 @@ describe("SDK daemon session CLI", () => {
 	});
 
 	afterEach(async () => {
-		await broker.stop();
-		await endpointServer.stop(true);
-		await fs.rm(root, { recursive: true, force: true });
+		// Every owned handle settles even when an earlier one throws, so one
+		// failure cannot strand this suite's listening socket or CLI children.
+		const survivors = await cliChildren.settle();
+		const failures: unknown[] = [];
+		const unsettled: string[] = [];
+		// `beforeEach` starts an in-process broker at this agent dir, so a broker
+		// was definitely launched here: its identity is captured before `stop()`
+		// removes the record, and a missing or unreadable record fails teardown
+		// rather than reading as nothing to settle. An in-process record names this
+		// runner, which its own `stop()` — never a signal — settles.
+		const settled = await settleFixtureBrokerWithOwner(agentDir, {
+			launched: true,
+			owner: () => broker.stop(),
+		});
+		if (settled.problem) unsettled.push(settled.problem);
+		failures.push(...settled.failures);
+		for (const release of [() => endpointServer.stop(true), () => fs.rm(root, { recursive: true, force: true })]) {
+			try {
+				await release();
+			} catch (error) {
+				failures.push(error);
+			}
+		}
+		expect(survivors).toEqual([]);
+		expect(unsettled).toEqual([]);
+		if (failures.length > 0) throw new AggregateError(failures, "SDK daemon CLI fixture teardown failed.");
 	});
 
 	it("AD-L-G02: uses the broker and per-session WebSocket endpoints without leaking ordinary credentials", async () => {

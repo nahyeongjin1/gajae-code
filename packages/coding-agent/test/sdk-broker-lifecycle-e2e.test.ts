@@ -1,5 +1,7 @@
 import { afterEach, expect, test, vi } from "bun:test";
+import type { ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 import * as syncFs from "node:fs";
 import { renameSync, writeFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
@@ -21,6 +23,7 @@ import {
 	setLifecycleCleanupHookForTest,
 	setLifecycleCommandResolverForTest,
 	setProcessIncarnationForTest,
+	setSpawnedChildObserverForTest,
 	writeSessionLifecycleFailure,
 } from "../src/sdk/broker/lifecycle";
 import { parseLifecycleJson } from "../src/sdk/broker/lifecycle-codec";
@@ -33,17 +36,117 @@ import { createSdkMcpServer } from "../src/sdk/mcp";
 import { listManagedSessionCandidates, resolveManagedSessionScope } from "../src/sdk/session-directory";
 import { sanitizeSdkStartupMessage } from "../src/sdk/startup-capability";
 import { SessionManager } from "../src/session/session-manager";
+import {
+	type FixtureBrokerDiscovery,
+	rememberFixtureBrokerAt,
+	settleFixtureBrokerTargets,
+	settleFixtureBrokerWithOwner,
+} from "./helpers/owned-children";
 
 const cliEntrypoint = path.resolve(import.meta.dir, "../src/cli.ts");
 const spawned: Array<ReturnType<typeof Bun.spawn>> = [];
-const brokerDirs: string[] = [];
+
+/**
+ * One temp agent directory this suite must account for at teardown.
+ *
+ * `launched` records that something this suite did *may* have caused a detached
+ * broker to exist under `agentDir`. It is set at the moment such a step starts —
+ * spawning a session host, or issuing a request that bootstraps a broker — and
+ * never derived from the parent's owner map: a broker a child started leaves no
+ * owner entry here, so reading the map would report `launched: false` for
+ * exactly the runs most likely to have leaked one.
+ */
+interface BrokerDirRegistration {
+	agentDir: string;
+	launched: boolean;
+}
+
+const brokerDirs: BrokerDirRegistration[] = [];
+/**
+ * Brokers whose identity was captured while their temp root still existed.
+ *
+ * Most tests here remove that root in their own `finally`, which deletes the
+ * discovery record before `afterEach` can read it. Without the earlier capture a
+ * detached broker would simply vanish from teardown's view and survive the run.
+ */
+const rememberedBrokers: FixtureBrokerDiscovery[] = [];
+
+/** Register a temp agent directory before anything can publish a broker in it. */
+function registerBrokerDir(agentDir: string): BrokerDirRegistration {
+	const existing = brokerDirs.find(registration => registration.agentDir === agentDir);
+	if (existing) return existing;
+	const registration: BrokerDirRegistration = { agentDir, launched: false };
+	brokerDirs.push(registration);
+	return registration;
+}
+
+/** The registration for `agentDir`, for tests that assert on its own bookkeeping. */
+function brokerDirRegistration(agentDir: string): BrokerDirRegistration | undefined {
+	return brokerDirs.find(registration => registration.agentDir === agentDir);
+}
+
+/**
+ * Drop a registration a test already settled itself, with its own assertion.
+ *
+ * A call site that captured the identity, released the owner, and asserted the
+ * typed verdict in its own `finally` has produced the proof this hook exists to
+ * demand. Leaving the registration behind would re-read a directory whose root
+ * and record are both gone and report that absence as an unproven launch.
+ */
+function releaseBrokerDir(agentDir: string): void {
+	const index = brokerDirs.findIndex(registration => registration.agentDir === agentDir);
+	if (index >= 0) brokerDirs.splice(index, 1);
+}
 
 afterEach(async () => {
-	for (const process of spawned.splice(0)) {
-		if (process.exitCode === null) process.kill("SIGTERM");
-		await process.exited;
+	const survivors: number[] = [];
+	// Owner-scoped: every handle below was created by this suite. Terminate each
+	// through its own handle with a bounded escalation, so one child that ignores
+	// SIGTERM cannot hang the hook and strand every later child as an orphan.
+	for (const child of spawned.splice(0)) {
+		if (child.exitCode === null) child.kill("SIGTERM");
+		const exited = async (): Promise<boolean> => {
+			await child.exited;
+			return true;
+		};
+		if (!(await Promise.race([exited(), Bun.sleep(2_000).then(() => false)]))) {
+			child.kill("SIGKILL");
+			await Promise.race([exited(), Bun.sleep(2_000).then(() => false)]);
+		}
+		if (child.exitCode === null && child.signalCode === null && child.pid) survivors.push(child.pid);
 	}
-	for (const agentDir of brokerDirs.splice(0)) await brokerOwnerForTest(agentDir)?.stop();
+	// Every registered directory and every captured identity is settled, even
+	// after one of them fails: stopping early would strand precisely the brokers
+	// a failing run is most likely to have leaked. The discovery record is read
+	// before each ensure owner is stopped, because stopping it removes the
+	// record, and the accumulated verdict is asserted once below.
+	const remembered = rememberedBrokers.splice(0);
+	// A directory whose broker identity was captured earlier is accounted for by
+	// that capture, which is settled — and judged — in the same pass below.
+	const capturedDirs = new Set(
+		remembered.map(entry => (entry.kind === "identity" ? entry.identity.agentDir : entry.agentDir)),
+	);
+	const settled = await settleFixtureBrokerTargets({
+		targets: brokerDirs.splice(0).map(registration => {
+			// A retained owner accounts for this directory's broker by itself: the
+			// launch it may have caused is exactly the child that owner stops. With
+			// neither an owner nor an earlier capture, a may-have-launched directory
+			// must still produce a record — the launch is tracked when it starts,
+			// never inferred from this map.
+			const owner = brokerOwnerForTest(registration.agentDir);
+			return {
+				agentDir: registration.agentDir,
+				launched: registration.launched && owner === undefined && !capturedDirs.has(registration.agentDir),
+				owner: async () => void (await owner?.stop()),
+			};
+		}),
+		remembered,
+	});
+	expect({
+		survivors,
+		unsettled: settled.problems,
+		failures: settled.failures.map(failure => (failure instanceof Error ? failure.message : String(failure))),
+	}).toEqual({ survivors: [], unsettled: [], failures: [] });
 });
 
 async function waitFor<T>(read: () => Promise<T | undefined>, label: string): Promise<T> {
@@ -177,16 +280,12 @@ test("ledger restart quarantines terminal response and durable-effect digest cor
 		const responseIdentity = "response-digest-corruption";
 		await ledger.begin(responseIdentity, "response-request");
 		const response = { ok: true, result: { sessionId: responseIdentity } };
-		await ledger.transition(responseIdentity, "terminal_ok", { response, responseDigest: "corrupt" });
+		await ledger.transition(responseIdentity, "terminal_ok", { response });
 		const effectsIdentity = "effects-digest-corruption";
 		await ledger.begin(effectsIdentity, "effects-request");
 		await ledger.transition(effectsIdentity, "terminal_ok", {
 			response,
-			responseDigest: createHash("sha256").update(canonicalJson(response)).digest("hex"),
-			durableEffects: {
-				worktree: { cwdDigest: "a", created: true, reused: false },
-				digest: "corrupt",
-			},
+			durableEffects: { worktree: { cwdDigest: "a", created: true, reused: false } },
 		});
 		const pendingIdentity = "pending-response-digest-corruption";
 		await ledger.begin(pendingIdentity, "pending-request");
@@ -211,9 +310,18 @@ test("ledger restart quarantines terminal response and durable-effect digest cor
 			.trim()
 			.split("\n")
 			.map(line => JSON.parse(line) as Record<string, unknown>);
-		const pendingRow = persistedRows.findLast(row => row.identity === pendingIdentity);
-		if (!pendingRow) throw new Error("Expected persisted pending cleanup row");
-		pendingRow.responseDigest = "corrupt";
+		// The writer refuses any row that is not broker outcome evidence, so digest
+		// corruption is injected into the durable source — the only place it can
+		// actually come from — rather than through the ledger API.
+		const corrupt = (identity: string, field: "responseDigest" | "durableEffects") => {
+			const row = persistedRows.findLast(candidate => candidate.identity === identity);
+			if (!row) throw new Error(`Expected persisted row for ${identity}`);
+			if (field === "responseDigest") row.responseDigest = "corrupt";
+			else row.durableEffects = { ...(row.durableEffects as Record<string, unknown>), digest: "corrupt" };
+		};
+		corrupt(responseIdentity, "responseDigest");
+		corrupt(effectsIdentity, "durableEffects");
+		corrupt(pendingIdentity, "responseDigest");
 		await fs.writeFile(ledgerPath, `${persistedRows.map(row => JSON.stringify(row)).join("\n")}\n`);
 		const reopened = await new LifecycleLedger(agentDir).open();
 		expect(await reopened.begin(responseIdentity, "response-request")).toMatchObject({ kind: "terminal_uncertain" });
@@ -350,8 +458,45 @@ test("legacy metadata cleanup rejects mixed lifecycle and arbitrary receipt keys
 	}
 });
 
-async function liveLifecycleSession(root: string, agentDir: string, sessionId: string, staleMarkerFirst = false) {
+/**
+ * Retain launch-time control over the broker this fixture's session host needs.
+ *
+ * A session host that finds no broker for its agent dir starts one itself, and
+ * that grandchild outlives both the host and any handle this process holds. A
+ * pid captured afterwards is not authority to stop it — macOS exposes no
+ * root-only signal primitive at all — so the only thing that can settle it is a
+ * lease held from launch. Starting one here leaves the production bootstrap
+ * path intact (the host still ensures a broker and still adopts exactly one)
+ * while giving this suite an exact child handle to close.
+ */
+async function retainFixtureBrokerLease(agentDir: string, registration: BrokerDirRegistration): Promise<void> {
+	if (brokerOwnerForTest(agentDir) || (await readSdkBrokerDiscovery(agentDir))) return;
+	registration.launched = true;
+	await startFixtureBrokerWithLeaseForTest({ agentDir });
+}
+
+interface LiveLifecycleSessionOptions {
+	staleMarkerFirst?: boolean;
+	/**
+	 * Fail deterministically once a broker is bootstrapped but before the
+	 * ordinary identity capture, which is the exact window a failing run leaks a
+	 * broker through.
+	 */
+	failAfterBrokerBootstrap?: boolean;
+}
+
+async function liveLifecycleSession(
+	root: string,
+	agentDir: string,
+	sessionId: string,
+	options: LiveLifecycleSessionOptions = {},
+) {
 	const stateRoot = path.join(root, ".gjc", "state");
+	// The spawned host adopts — or, without the lease below, starts — a broker
+	// under this agent dir, so teardown must own that directory as well as the
+	// child handle itself.
+	const registration = registerBrokerDir(agentDir);
+	await retainFixtureBrokerLease(agentDir, registration);
 	const request = {
 		operation: "session.create",
 		sessionId,
@@ -378,7 +523,7 @@ async function liveLifecycleSession(root: string, agentDir: string, sessionId: s
 	if (!child.pid) throw new Error("session host has no pid");
 	const childIncarnation = await incarnation(child.pid);
 	await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
-	if (staleMarkerFirst) {
+	if (options.staleMarkerFirst) {
 		await fs.writeFile(
 			path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`),
 			JSON.stringify({ pid: child.pid, effectMarker: "stale-effect", incarnation: childIncarnation }),
@@ -389,6 +534,30 @@ async function liveLifecycleSession(root: string, agentDir: string, sessionId: s
 		path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`),
 		JSON.stringify({ pid: child.pid, effectMarker: "subprocess-proof", incarnation: childIncarnation }),
 	);
+	// The endpoint file is published before the child's `host_registered` row
+	// reaches the broker, so a broker discovery record can still be a few
+	// milliseconds away. Poll for it: the caller's own `finally` deletes the temp
+	// root — and that record with it — long before `afterEach` could read it, and
+	// a capture that gives up early leaks the broker instead.
+	let captured = false;
+	const captureBrokerIdentity = async (timeoutMs: number): Promise<void> => {
+		if (captured) return;
+		captured = true;
+		const deadline = Date.now() + timeoutMs;
+		for (;;) {
+			// A record that is merely absent may still be moments away; anything the
+			// reader could classify — an identity, this runner, or an unreadable
+			// record — is captured as-is so teardown judges it rather than guessing.
+			const remembered = await rememberFixtureBrokerAt(agentDir).catch(
+				(): FixtureBrokerDiscovery => ({ kind: "identity_malformed", agentDir }),
+			);
+			if (remembered.kind !== "identity_unavailable" || Date.now() >= deadline) {
+				rememberedBrokers.push(remembered);
+				return;
+			}
+			await Bun.sleep(25);
+		}
+	};
 	try {
 		const endpoint = await waitFor(async () => {
 			try {
@@ -400,6 +569,11 @@ async function liveLifecycleSession(root: string, agentDir: string, sessionId: s
 				return undefined;
 			}
 		}, "session endpoint");
+		if (options.failAfterBrokerBootstrap) {
+			await waitFor(async () => (await readSdkBrokerDiscovery(agentDir)) ?? undefined, "bootstrapped broker");
+			throw new Error("injected lifecycle failure after broker bootstrap");
+		}
+		await captureBrokerIdentity(10_000);
 		return { child, endpoint };
 	} catch (error) {
 		if (child.exitCode === null) child.kill("SIGTERM");
@@ -407,6 +581,13 @@ async function liveLifecycleSession(root: string, agentDir: string, sessionId: s
 		throw new Error(
 			`${error instanceof Error ? error.message : String(error)}; child exit=${child.exitCode}; stdout=${await new Response(child.stdout).text()}; stderr=${await new Response(child.stderr).text()}`,
 		);
+	} finally {
+		// Whatever happened above, the identity is captured here — before the
+		// caller's own `finally` removes the temp root and destroys the only
+		// authority naming a broker this fixture may have caused to exist. A
+		// failure between bootstrap and the ordinary capture above is exactly the
+		// window that used to report `launched: false` and leak the broker.
+		await captureBrokerIdentity(5_000);
 	}
 }
 
@@ -414,14 +595,56 @@ test("lifecycle child ignores a stale marker until its current effect marker rep
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-stale-marker-"));
 	const agentDir = path.join(root, "agent");
 	try {
-		const { child, endpoint } = await liveLifecycleSession(root, agentDir, "stale-marker", true);
-		expect(endpoint.url).toStartWith("ws://");
-		child.kill("SIGTERM");
-		await child.exited;
+		const host = await liveLifecycleSession(root, agentDir, "stale-marker", { staleMarkerFirst: true });
+		try {
+			expect(host.endpoint.url).toStartWith("ws://");
+		} finally {
+			// Settled through its own handle even when the assertion throws; the
+			// shared teardown then settles the broker this host spawned.
+			if (host.child.exitCode === null) host.child.kill("SIGTERM");
+			await host.child.exited;
+		}
 	} finally {
 		await fs.rm(root, { recursive: true, force: true });
 	}
 }, 20_000);
+
+/**
+ * The exact window a failing lifecycle run used to leak a broker through.
+ *
+ * A session host whose broker is already bootstrapped can still fail before the
+ * ordinary identity capture — an endpoint wait that times out, an assertion, a
+ * cancelled run. The caller's own `finally` then removes the temp root, taking
+ * the discovery record with it, and teardown is left holding nothing that names
+ * a process which may still be running. Registering the directory as
+ * may-have-launched when the child starts, and capturing the identity in a
+ * `finally` before any root deletion, is what keeps that path fail-closed
+ * instead of falsely green.
+ */
+test("a lifecycle failure after broker bootstrap still captures the broker identity before its root is removed", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-capture-race-"));
+	const agentDir = path.join(root, "agent");
+	const alreadyRemembered = rememberedBrokers.length;
+	try {
+		await expect(
+			liveLifecycleSession(root, agentDir, "capture-race", { failAfterBrokerBootstrap: true }),
+		).rejects.toThrow("injected lifecycle failure after broker bootstrap");
+
+		// The directory is accounted for as may-have-launched on its own terms,
+		// never inferred from whether this process happens to hold an owner handle.
+		expect(brokerDirRegistration(agentDir)).toEqual({ agentDir, launched: true });
+		// The identity was captured while the record still existed, so the shared
+		// teardown settles that exact process even though the root is about to go.
+		const captured = rememberedBrokers.slice(alreadyRemembered);
+		expect(captured).toHaveLength(1);
+		const identity = captured[0];
+		if (identity?.kind !== "identity") throw new Error(`Expected a captured broker identity, got ${identity?.kind}`);
+		expect(identity.identity.agentDir).toBe(agentDir);
+		expect(identity.identity.pid).toBeGreaterThan(0);
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 30_000);
 
 test("lifecycle host rejects a transcript replaced after strict authorization before it can be consumed", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-transcript-race-"));
@@ -1278,6 +1501,20 @@ test("broker directly resumes and forks a canonical cold saved session with scop
 				() => false,
 			),
 		).toBe(false);
+		// Every cold resume/fork lifecycle outcome persists a valid terminal row;
+		// broker persistence verification must read that row back as itself and
+		// never manufacture a second final row or a terminal_uncertain overwrite.
+		const coldRows = (await fs.readFile(path.join(agentDir, "sdk", "lifecycle-ledger.jsonl"), "utf8"))
+			.split("\n")
+			.filter(Boolean)
+			.map(line => JSON.parse(line) as { identity: string; state: string });
+		const coldFinalStates = new Set(["terminal_ok", "terminal_error", "terminal_uncertain"]);
+		expect(coldRows.some(row => row.state === "terminal_uncertain")).toBe(false);
+		for (const identity of new Set(coldRows.map(row => row.identity)))
+			expect(coldRows.filter(row => row.identity === identity && coldFinalStates.has(row.state))).toHaveLength(1);
+		expect(
+			await fs.stat(path.join(agentDir, "sdk", "lifecycle-ledger.jsonl.corrupt")).catch(() => undefined),
+		).toBeUndefined();
 	} finally {
 		await broker.stop();
 		await fs.rm(root, { recursive: true, force: true });
@@ -2621,10 +2858,32 @@ test("broker records the resolved worktree state root and preserves pre-child pr
 		await fs.rm(root, { recursive: true, force: true });
 	}
 }, 20_000);
+/**
+ * A terminal row the broker could not read back is never proof, and the in-memory
+ * copy of that row is not a substitute for it. Every same-key replay must reprove
+ * the durable evidence, report the same generic uncertainty while it cannot, and
+ * leave the ledger with exactly one final row — while an authoritative re-read is
+ * explicit revalidation that may replay the original outcome again.
+ */
 test("broker fails closed when the reopened terminal ledger cannot reproduce its response", async () => {
 	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-ledger-mismatch-"));
+	const ledgerPath = path.join(agentDir, "sdk", "lifecycle-ledger.jsonl");
 	const broker = new Broker({ agentDir });
 	const originalReadTerminal = LifecycleLedger.prototype.readTerminal;
+	const unverified = {
+		ok: false,
+		error: {
+			code: "terminal_uncertain",
+			message:
+				"Lifecycle terminal evidence could not be verified after persistence; retained artifacts require reconciliation.",
+		},
+	};
+	const finalRows = async () =>
+		(await fs.readFile(ledgerPath, "utf8"))
+			.split("\n")
+			.filter(Boolean)
+			.map(line => JSON.parse(line) as { state: string; response?: BrokerResponse })
+			.filter(row => FINAL_LEDGER_STATES.has(row.state));
 	try {
 		await broker.start();
 		LifecycleLedger.prototype.readTerminal = async () => undefined;
@@ -2633,14 +2892,33 @@ test("broker fails closed when the reopened terminal ledger cannot reproduce its
 			{ sessionId: "ledger-mismatch" },
 			"ledger-mismatch",
 		);
-		expect(response).toEqual({
-			ok: false,
-			error: {
-				code: "terminal_uncertain",
-				message:
-					"Lifecycle terminal evidence could not be verified after persistence; retained artifacts require reconciliation.",
-			},
-		});
+		expect(response).toEqual(unverified);
+		// The same key retried in the same process still sees the original terminal row
+		// in memory; it must not be promoted while its durable evidence stays unreadable.
+		expect(
+			await broker.handleRequest("session.unknown", { sessionId: "ledger-mismatch" }, "ledger-mismatch"),
+		).toEqual(unverified);
+		// A different request hash under the same identity stays fenced by idempotency.
+		expect(
+			await broker.handleRequest("session.unknown", { sessionId: "ledger-mismatch", attempt: 2 }, "ledger-mismatch"),
+		).toMatchObject({ ok: false, error: { code: "idempotency_conflict" } });
+		const unverifiedFinals = await finalRows();
+		expect(unverifiedFinals).toHaveLength(1);
+		expect(await fs.stat(`${ledgerPath}.corrupt`).catch(() => undefined)).toBeUndefined();
+
+		// Restoring the authoritative read is the revalidation the fence was waiting on.
+		LifecycleLedger.prototype.readTerminal = originalReadTerminal;
+		const persisted = unverifiedFinals[0]?.response;
+		if (!persisted) throw new Error("Expected a durable terminal response to revalidate");
+		const revalidated = await broker.handleRequest(
+			"session.unknown",
+			{ sessionId: "ledger-mismatch" },
+			"ledger-mismatch",
+		);
+		expect(revalidated).toEqual(persisted);
+		expect(revalidated).not.toEqual(unverified);
+		expect(await finalRows()).toHaveLength(1);
+		expect(await fs.stat(`${ledgerPath}.corrupt`).catch(() => undefined)).toBeUndefined();
 	} finally {
 		LifecycleLedger.prototype.readTerminal = originalReadTerminal;
 		await broker.stop();
@@ -3076,7 +3354,9 @@ test("shipped sdk session-host-internal stays alive only after a semantic ready 
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-subprocess-"));
 	const agentDir = path.join(root, "agent");
 	const sessionId = "shipped-subprocess";
-	brokerDirs.push(agentDir);
+	// The lease below launches this directory's broker, so the registration is
+	// marked before it starts rather than after an owner happens to appear.
+	registerBrokerDir(agentDir).launched = true;
 	const brokerFixture = await startFixtureBrokerWithLeaseForTest({ agentDir });
 	expect(brokerOwnerForTest(agentDir)).toBeDefined();
 	try {
@@ -3350,6 +3630,82 @@ test("production broker session.create authenticates a source-workspace v3 nativ
 	}
 }, 20_000);
 
+/**
+ * The production create path for a prepared session, end to end.
+ *
+ * Preparation exists only so a daemon-owned chat binding can claim the root
+ * before readiness. A child with no configured Slack target has no such bind
+ * authority, so a prepared session there would be activatable with no binding
+ * at all — the exact ordering the prepare phase exists to remove. The child
+ * must fail its lifecycle startup closed instead of degrading to ordinary
+ * immediate readiness or handing back an unprotected prepared receipt.
+ */
+test("production broker session.create fails a deferred request closed when the child has no bind authority", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-prepared-create-"));
+	const agentDir = path.join(root, "agent");
+	const broker = new Broker({ agentDir });
+	try {
+		await broker.start();
+		const created = await broker.handleRequest(
+			"session.create",
+			{ cwd: root, readiness: "deferred", readinessTimeoutMs: 10_000 },
+			"prepared-create",
+		);
+		expect(created).toMatchObject({
+			ok: false,
+			error: { code: "spawn_failed", endpoint: "unavailable" },
+			startupFailure: {
+				phase: "startup",
+				reason: "failed",
+				message:
+					"Existing-thread preparation requires a configured Slack notification target for this session to prove the existing-thread binding.",
+				// The refusal lands before any endpoint generation exists, and the
+				// child is fully rolled back rather than left prepared.
+				rollback: {
+					endpointGeneration: null,
+					fenced: true,
+					runtimeRemoved: true,
+					hostStopped: true,
+					brokerRegistrationReleased: true,
+				},
+				cleanupProof: { processExited: true, endpointRemoved: true, hostUnregistered: { state: "not_registered" } },
+			},
+		});
+		// Nothing was published for this request: no session and no endpoint, so no
+		// readiness, notification, or root can exist for it.
+		expect(await broker.handleRequest("session.list", {})).toMatchObject({ ok: true, result: { sessions: [] } });
+		expect(await fs.readdir(path.join(root, ".gjc", "state", "sdk")).catch(() => [] as string[])).not.toContainEqual(
+			expect.stringMatching(/^[^.].*\.json$/),
+		);
+	} finally {
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 20_000);
+
+/** Ordinary creation is untouched: no prepared signal, immediate readiness. */
+test("production broker session.create rejects a foreign readiness intent", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-prepared-reject-"));
+	const broker = new Broker({ agentDir: path.join(root, "agent") });
+	try {
+		await broker.start();
+		for (const readiness of ["prepared", "Deferred", "", 1, true, null]) {
+			expect(
+				await broker.handleRequest("session.create", { cwd: root, readiness }, `bad-${String(readiness)}`),
+			).toEqual({
+				ok: false,
+				error: {
+					code: "invalid_input",
+					message: "readiness must be either immediate or deferred.",
+				},
+			});
+		}
+	} finally {
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 20_000);
+
 test("broker agentDir profile validates, activates, and is discoverable through session Q27", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-profile-agent-dir-"));
 	const cwd = path.join(root, "workspace");
@@ -3495,7 +3851,12 @@ test("broker close acknowledges before terminating the lifecycle child and prese
 test("ACP, MCP, and daemon global requests bootstrap a broker with zero sessions", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-zero-global-"));
 	const agentDirs = ["acp", "mcp", "daemon"].map(name => path.join(root, name, "agent"));
-	brokerDirs.push(...agentDirs);
+	// Each surface below may bootstrap a detached broker under its own directory,
+	// so every one is registered as may-have-launched before the first request —
+	// never inferred afterwards from this process's owner map, which a broker
+	// started by a child would never appear in.
+	const registrations = agentDirs.map(agentDir => registerBrokerDir(agentDir));
+	for (const registration of registrations) registration.launched = true;
 	try {
 		const acp = new AcpAgent({ signal: new AbortController().signal } as never, { agentDir: agentDirs[0] });
 		expect(await acp.listSessions({})).toEqual({ sessions: [] });
@@ -3516,7 +3877,25 @@ test("ACP, MCP, and daemon global requests bootstrap a broker with zero sessions
 		expect(output).toMatchObject([{ ok: true, result: { sessions: [] } }]);
 		expect(await readSdkBrokerDiscovery(agentDirs[2])).not.toBeNull();
 	} finally {
+		// Settle each broker these surfaces ensured *before* the root is removed.
+		// Deleting the root first destroys the discovery record that is this
+		// process's only authority naming a detached broker, which would leave
+		// teardown with nothing to prove cleanup against.
+		const settled = [];
+		for (const agentDir of agentDirs) {
+			const owner = brokerOwnerForTest(agentDir);
+			settled.push(
+				await settleFixtureBrokerWithOwner(agentDir, {
+					launched: true,
+					owner: async () => void (await owner?.stop()),
+				}),
+			);
+			// Settled here, with the assertion below as its proof; the shared hook
+			// would otherwise re-read a directory whose root and record are gone.
+			releaseBrokerDir(agentDir);
+		}
 		await fs.rm(root, { recursive: true, force: true });
+		expect(settled.flatMap(result => [...result.failures, ...(result.problem ? [result.problem] : [])])).toEqual([]);
 	}
 }, 20_000);
 
@@ -3772,3 +4151,503 @@ test("lifecycle cleanup receipt parser rejects hostile bounded inputs without to
 		await fs.rm(root, { recursive: true, force: true });
 	}
 });
+
+/**
+ * Drives the exact R6 production shape: a spawned lifecycle child publishes an
+ * owned startup-failure receipt with a fully released rollback, and the broker
+ * can no longer prove durable process identity (so it must refuse to signal).
+ * The exact-process observation is transiently indistinguishable from "still
+ * alive" before it becomes affirmatively absent, which previously turned a
+ * bounded exit race into durable cleanup uncertainty.
+ */
+async function writeTransientExitFixture(root: string): Promise<string> {
+	const fixture = path.join(root, "transient-exit-child.ts");
+	await fs.writeFile(
+		fixture,
+		`import * as fs from "node:fs/promises";
+import { writeSessionLifecycleFailure } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/sdk/broker/lifecycle.ts"))};
+const request = JSON.parse(process.env.GJC_SDK_LIFECYCLE_REQUEST!);
+await writeSessionLifecycleFailure(
+	request.stateRoot,
+	request.sessionId,
+	request.effectMarker,
+	{
+		phase: "startup",
+		reason: "failed",
+		message: "Existing-thread preparation requires a configured Slack notification target for this session to prove the existing-thread binding.",
+	},
+	{ endpointGeneration: null, fenced: true, runtimeRemoved: true, hostStopped: true, brokerRegistrationReleased: true },
+	undefined,
+	"stable:" + process.pid,
+);
+await fs.writeFile(process.argv[2]!, String(process.pid));
+await new Promise(() => {});
+`,
+	);
+	return fixture;
+}
+
+/**
+ * Same released-rollback receipt as the transient fixture, but published under the
+ * child's real OS incarnation so the broker's unstubbed durable-identity check can
+ * authorize an exact verified signal against this process.
+ */
+async function writeRealIncarnationExitFixture(root: string): Promise<string> {
+	const fixture = path.join(root, "real-incarnation-child.ts");
+	await fs.writeFile(
+		fixture,
+		`import * as fs from "node:fs/promises";
+import { processIncarnation, writeSessionLifecycleFailure } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/sdk/broker/lifecycle.ts"))};
+const request = JSON.parse(process.env.GJC_SDK_LIFECYCLE_REQUEST!);
+const incarnation = processIncarnation(process.pid);
+if (!incarnation) throw new Error("fixture child has no readable OS incarnation");
+await writeSessionLifecycleFailure(
+	request.stateRoot,
+	request.sessionId,
+	request.effectMarker,
+	{
+		phase: "startup",
+		reason: "failed",
+		message: "Existing-thread preparation requires a configured Slack notification target for this session to prove the existing-thread binding.",
+	},
+	{ endpointGeneration: null, fenced: true, runtimeRemoved: true, hostStopped: true, brokerRegistrationReleased: true },
+	undefined,
+	incarnation,
+);
+await fs.writeFile(process.argv[2]!, String(process.pid));
+await new Promise(() => {});
+`,
+	);
+	return fixture;
+}
+
+type RetainedFixtureChildTeardown = {
+	outcome: "already_exited" | "settled" | "survived";
+	diagnostics: string[];
+};
+
+/**
+ * Settle exactly the child this suite's broker retained at launch, through that
+ * retained handle and nothing else.
+ *
+ * Authority is the `ChildProcess` object the spawn seam handed over, never a pid
+ * observed later: Node refuses to signal through a handle it has already reaped,
+ * and an unreaped child still owns its pid, so this can never reach a pid-reuse
+ * replacement. The handle's own `exitCode`/`signalCode` decide whether a signal is
+ * needed at all, teardown then awaits that same handle's exit or close, and a
+ * child that outlives the bound is reported instead of assumed settled.
+ *
+ * `error` alone is never settlement: a refused or undeliverable signal reports
+ * there without the OS ever reaping the child, so it is retained as a diagnostic
+ * while proof still has to come from the handle's own exit/close. A synchronous
+ * `kill` throw and a `false` return are recorded the same way. No raw pid, name,
+ * group, tree, or discovery-derived signal authority is ever used as a fallback.
+ */
+async function settleRetainedFixtureChild(
+	child: ChildProcess | undefined,
+	timeoutMs = 10_000,
+): Promise<RetainedFixtureChildTeardown> {
+	if (!child || child.exitCode !== null || child.signalCode !== null)
+		return { outcome: "already_exited", diagnostics: [] };
+	const diagnostics: string[] = [];
+	const settled = Promise.withResolvers<void>();
+	let reaped = false;
+	const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+		reaped = true;
+		diagnostics.push(`exit code=${code ?? "null"} signal=${signal ?? "null"}`);
+		settled.resolve();
+	};
+	const onClose = (code: number | null, signal: NodeJS.Signals | null) => {
+		reaped = true;
+		diagnostics.push(`close code=${code ?? "null"} signal=${signal ?? "null"}`);
+		settled.resolve();
+	};
+	const onError = (error: Error) => {
+		diagnostics.push(`error ${error.message}`);
+	};
+	child.on("exit", onExit);
+	child.on("close", onClose);
+	child.on("error", onError);
+	const bound = Promise.withResolvers<void>();
+	const timer = setTimeout(() => bound.resolve(), timeoutMs);
+	try {
+		try {
+			if (child.kill("SIGKILL") !== true) diagnostics.push("kill returned false");
+		} catch (error) {
+			diagnostics.push(`kill threw ${error instanceof Error ? error.message : String(error)}`);
+		}
+		await Promise.race([settled.promise, bound.promise]);
+		const proven = reaped || child.exitCode !== null || child.signalCode !== null;
+		if (!proven) diagnostics.push("no exit or close observed within the teardown bound");
+		return { outcome: proven ? "settled" : "survived", diagnostics };
+	} finally {
+		clearTimeout(timer);
+		child.off("exit", onExit);
+		child.off("close", onClose);
+		child.off("error", onError);
+	}
+}
+
+/**
+ * Release a fixture's temp lifecycle authority only once its exact retained child
+ * is proven settled.
+ *
+ * An unsettled or unprovable child keeps its root: the lifecycle marker, endpoint,
+ * and failure receipts under it are the only authority that can reconcile that
+ * exact process, so deleting them would destroy the evidence. The preserved path
+ * is reported instead of dropped.
+ */
+async function releaseRetainedFixtureRoot(
+	teardown: RetainedFixtureChildTeardown,
+	root: string,
+): Promise<Error | undefined> {
+	if (teardown.outcome === "survived")
+		return new Error(
+			`Retained fixture child survived its exact-handle teardown; preserved evidence root: ${root}${
+				teardown.diagnostics.length > 0 ? ` (${teardown.diagnostics.join("; ")})` : ""
+			}`,
+		);
+	await fs.rm(root, { recursive: true, force: true });
+	return undefined;
+}
+
+async function readLifecycleLedgerRows(
+	agentDir: string,
+): Promise<Array<{ identity: string; state: string; intendedSessionId?: string; response?: unknown }>> {
+	const source = await fs.readFile(path.join(agentDir, "sdk", "lifecycle-ledger.jsonl"), "utf8").catch(() => "");
+	return source
+		.split("\n")
+		.filter(Boolean)
+		.map(
+			line =>
+				JSON.parse(line) as { identity: string; state: string; intendedSessionId?: string; response?: unknown },
+		);
+}
+
+const FINAL_LEDGER_STATES = new Set(["terminal_ok", "terminal_error", "terminal_uncertain"]);
+
+/**
+ * `same-incarnation` keeps the exact process readable and indistinguishable from
+ * a live child (the signal-refused window); `unreadable` reproduces the observed
+ * production window where the process-table entry still answers but its
+ * incarnation cannot be read yet, so the observation is `uncertain` and no signal
+ * is attempted at all. Both must converge on the remaining lifecycle deadline.
+ */
+for (const transientPhase of ["same-incarnation", "unreadable"] as const) {
+	test(`broker converges a transiently ${transientPhase} spawned-child exit into spawn_failed with zero residue`, async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", `gjc-broker-transient-${transientPhase}-`));
+		const agentDir = path.join(root, "agent");
+		const settleMarker = path.join(root, "child-settled");
+		const broker = new Broker({ agentDir });
+		let retainedChild: ChildProcess | undefined;
+		const failures: unknown[] = [];
+		let transientObservations = 0;
+		const transientLimit = 12;
+		try {
+			const fixture = await writeTransientExitFixture(root);
+			setLifecycleCommandResolverForTest(broker, () => ({
+				file: process.execPath,
+				args: [fixture, settleMarker],
+			}));
+			setSpawnedChildObserverForTest(broker, child => {
+				retainedChild ??= child;
+			});
+			setProcessIncarnationForTest(broker, pid => {
+				if (!syncFs.existsSync(settleMarker)) return `stable:${pid}`;
+				transientObservations += 1;
+				if (transientObservations > transientLimit) return `rotated:${pid}`;
+				return transientPhase === "same-incarnation" ? `stable:${pid}` : undefined;
+			});
+			await broker.start();
+			const response = await broker.handleRequest(
+				"session.create",
+				{ cwd: root, readiness: "deferred", readinessTimeoutMs: 6_000 },
+				`transient-${transientPhase}-convergence`,
+			);
+			expect(retainedChild?.pid).toBeGreaterThan(0);
+			expect(response).toMatchObject({ ok: false, error: { code: "spawn_failed", endpoint: "unavailable" } });
+			expect(transientObservations).toBeGreaterThan(transientLimit);
+			expect(await broker.handleRequest("session.list", {})).toMatchObject({
+				ok: true,
+				result: { sessions: [] },
+			});
+			const sdkDir = path.join(root, ".gjc", "state", "sdk");
+			// Dot-prefixed `.gjc-delete-*` detach quarantines and native unlink placeholders
+			// are the receipt-bound durable evidence of an exact detach; no live endpoint,
+			// lifecycle marker, or failure artifact may survive a proven rollback.
+			expect((await fs.readdir(sdkDir).catch(() => [])).filter(name => !name.startsWith("."))).toEqual([]);
+			const rows = await readLifecycleLedgerRows(agentDir);
+			for (const identity of new Set(rows.map(row => row.identity)))
+				expect(rows.filter(row => row.identity === identity && FINAL_LEDGER_STATES.has(row.state))).toHaveLength(1);
+			expect(rows.some(row => row.state === "terminal_uncertain")).toBe(false);
+			expect(
+				await fs.stat(path.join(agentDir, "sdk", "lifecycle-ledger.jsonl.corrupt")).catch(() => undefined),
+			).toBeUndefined();
+		} catch (error) {
+			failures.push(error);
+		} finally {
+			setProcessIncarnationForTest(broker, undefined);
+			setLifecycleCommandResolverForTest(broker, undefined);
+			setSpawnedChildObserverForTest(broker, undefined);
+			// Settle the exact retained child before any temp state is deleted, even when
+			// the body above threw, and surface a survivor instead of dropping it. A child
+			// that is not proven settled keeps this root: its lifecycle authority is the
+			// only thing that can reconcile that exact process.
+			const teardown = await settleRetainedFixtureChild(retainedChild);
+			await broker.stop();
+			const preserved = await releaseRetainedFixtureRoot(teardown, root);
+			if (preserved) failures.push(preserved);
+		}
+		if (failures.length === 1) throw failures[0];
+		if (failures.length > 1) throw new AggregateError(failures, "transient-exit convergence failed");
+	}, 30_000);
+}
+
+test("broker retains one proven terminal uncertainty when a spawned-child exit never becomes provable", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-unprovable-exit-"));
+	const agentDir = path.join(root, "agent");
+	const settleMarker = path.join(root, "child-settled");
+	const broker = new Broker({ agentDir });
+	let retainedChild: ChildProcess | undefined;
+	const failures: unknown[] = [];
+	try {
+		const fixture = await writeTransientExitFixture(root);
+		setLifecycleCommandResolverForTest(broker, () => ({
+			file: process.execPath,
+			args: [fixture, settleMarker],
+		}));
+		setSpawnedChildObserverForTest(broker, child => {
+			retainedChild ??= child;
+		});
+		setProcessIncarnationForTest(broker, pid => {
+			return `stable:${pid}`;
+		});
+		await broker.start();
+		const response = await broker.handleRequest(
+			"session.create",
+			{ cwd: root, readiness: "deferred", readinessTimeoutMs: 6_000 },
+			"unprovable-exit-uncertainty",
+		);
+		expect(retainedChild?.pid).toBeGreaterThan(0);
+		// A permanently unprovable exit must stay fail-closed and must never be
+		// reported as a proven spawn_failed rollback.
+		expect(response).toMatchObject({
+			ok: false,
+			error: {
+				code: "terminal_uncertain",
+				message: "Lifecycle startup cleanup could not be proven; retained artifacts require reconciliation.",
+			},
+		});
+		const rows = await readLifecycleLedgerRows(agentDir);
+		const uncertain = rows.filter(row => row.state === "terminal_uncertain");
+		expect(uncertain).toHaveLength(1);
+		for (const identity of new Set(rows.map(row => row.identity)))
+			expect(rows.filter(row => row.identity === identity && FINAL_LEDGER_STATES.has(row.state))).toHaveLength(1);
+		// The persisted uncertainty must be read back as itself, never overwritten
+		// by the broker's own generic persistence-verification uncertainty.
+		expect((uncertain[0]?.response as { error?: { message?: string } } | undefined)?.error?.message).toBe(
+			"Lifecycle startup cleanup could not be proven; retained artifacts require reconciliation.",
+		);
+		const sessionId = uncertain[0]?.intendedSessionId;
+		expect(typeof sessionId).toBe("string");
+		const sdkDir = path.join(root, ".gjc", "state", "sdk");
+		const retained = await fs.readdir(sdkDir);
+		expect(retained).toContain(`${sessionId}.lifecycle.json`);
+		expect(retained.some(name => name.startsWith(`${sessionId}.lifecycle.failure.`))).toBe(true);
+		expect(await broker.handleRequest("session.list", {})).toMatchObject({
+			ok: true,
+			result: { sessions: [expect.objectContaining({ sessionId, terminalUncertain: true })] },
+		});
+		await broker.stop();
+		// Reopening must not quarantine the broker's own proven uncertainty.
+		const reopened = await new LifecycleLedger(agentDir).open();
+		expect(reopened.warnings).toEqual([]);
+		expect(
+			await fs.stat(path.join(agentDir, "sdk", "lifecycle-ledger.jsonl.corrupt")).catch(() => undefined),
+		).toBeUndefined();
+	} catch (error) {
+		failures.push(error);
+	} finally {
+		setProcessIncarnationForTest(broker, undefined);
+		setLifecycleCommandResolverForTest(broker, undefined);
+		setSpawnedChildObserverForTest(broker, undefined);
+		// Settle the exact retained child before any temp state is deleted, even when
+		// the body above threw, and surface a survivor instead of dropping it. A child
+		// that is not proven settled keeps this root: its lifecycle authority is the
+		// only thing that can reconcile that exact process.
+		const teardown = await settleRetainedFixtureChild(retainedChild);
+		await broker.stop();
+		const preserved = await releaseRetainedFixtureRoot(teardown, root);
+		if (preserved) failures.push(preserved);
+	}
+	if (failures.length === 1) throw failures[0];
+	if (failures.length > 1) throw new AggregateError(failures, "unprovable-exit uncertainty failed");
+}, 30_000);
+
+/**
+ * A retained-handle survivor and a synchronous kill refusal are observed, not
+ * assumed: an `error` alone never proves an exit, and an unsettled child keeps
+ * its temp lifecycle authority so the evidence can be reconciled instead of
+ * deleted. No raw-PID fallback is ever attempted for these handles.
+ */
+class FakeRetainedChild extends EventEmitter {
+	exitCode: number | null = null;
+	signalCode: NodeJS.Signals | null = null;
+	killCalls = 0;
+	#behaviour: "throws" | "refuses" | "errors" | "exits";
+
+	constructor(behaviour: "throws" | "refuses" | "errors" | "exits") {
+		super();
+		this.#behaviour = behaviour;
+	}
+
+	kill(): boolean {
+		this.killCalls += 1;
+		if (this.#behaviour === "throws") throw new Error("kill refused by the OS");
+		if (this.#behaviour === "refuses") return false;
+		if (this.#behaviour === "errors") {
+			queueMicrotask(() => this.emit("error", new Error("signal delivery failed")));
+			return true;
+		}
+		queueMicrotask(() => {
+			this.signalCode = "SIGKILL";
+			this.emit("exit", null, "SIGKILL");
+			this.emit("close", null, "SIGKILL");
+		});
+		return true;
+	}
+}
+
+const fakeRetainedChild = (behaviour: "throws" | "refuses" | "errors" | "exits"): ChildProcess =>
+	new FakeRetainedChild(behaviour) as unknown as ChildProcess;
+
+test("retained-child teardown reports survivors with diagnostics and preserves their evidence root", async () => {
+	const surviving: Array<{ behaviour: "throws" | "refuses" | "errors"; diagnostic: string }> = [
+		{ behaviour: "throws", diagnostic: "kill threw" },
+		{ behaviour: "refuses", diagnostic: "kill returned false" },
+		{ behaviour: "errors", diagnostic: "error " },
+	];
+	for (const { behaviour, diagnostic } of surviving) {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", `gjc-retained-${behaviour}-`));
+		const marker = path.join(root, "session.lifecycle.json");
+		await fs.writeFile(marker, "lifecycle-authority");
+		const child = fakeRetainedChild(behaviour);
+		const teardown = await settleRetainedFixtureChild(child, 50);
+		expect(teardown.outcome).toBe("survived");
+		expect(teardown.diagnostics.some(entry => entry.startsWith(diagnostic))).toBe(true);
+		const preserved = await releaseRetainedFixtureRoot(teardown, root);
+		expect(preserved?.message).toContain(root);
+		// An unsettled child never loses its lifecycle authority.
+		expect(await fs.readFile(marker, "utf8")).toBe("lifecycle-authority");
+		await fs.rm(root, { recursive: true, force: true });
+	}
+
+	// A handle that actually exits and reaps settles, and only then may its temp
+	// authority be released.
+	const settledRoot = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-retained-settled-"));
+	await fs.writeFile(path.join(settledRoot, "session.lifecycle.json"), "lifecycle-authority");
+	const settled = await settleRetainedFixtureChild(fakeRetainedChild("exits"), 5_000);
+	expect(settled.outcome).toBe("settled");
+	expect(await releaseRetainedFixtureRoot(settled, settledRoot)).toBeUndefined();
+	expect(await fs.stat(settledRoot).catch(() => undefined)).toBeUndefined();
+
+	// An already-reaped handle is never signalled again.
+	const alreadyExited = new FakeRetainedChild("throws");
+	alreadyExited.exitCode = 0;
+	const noop = await settleRetainedFixtureChild(alreadyExited as unknown as ChildProcess, 50);
+	expect(noop.outcome).toBe("already_exited");
+	expect(alreadyExited.killCalls).toBe(0);
+	expect(await settleRetainedFixtureChild(undefined, 50)).toMatchObject({ outcome: "already_exited" });
+}, 30_000);
+
+/**
+ * The spawn observer is a test seam, but a throwing observer must never strand
+ * the exact child it was handed. Production has to own that child's pid and
+ * incarnation authority and its durable lifecycle marker before the seam runs,
+ * so the failure path can settle exactly that process through the existing
+ * verified signal contract instead of losing it.
+ *
+ * This runs against the real OS incarnation authority on purpose: the durable
+ * marker's incarnation is re-read with the unstubbed reader before any signal is
+ * authorized, so a stubbed incarnation could never prove durable identity and the
+ * verified signal would be refused before it was ever attempted.
+ */
+test("broker settles the exact spawned child when the spawn observer throws after capture", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-observer-throw-"));
+	const agentDir = path.join(root, "agent");
+	const settleMarker = path.join(root, "child-settled");
+	const broker = new Broker({ agentDir });
+	let retainedChild: ChildProcess | undefined;
+	let observerInvocations = 0;
+	const failures: unknown[] = [];
+	try {
+		const fixture = await writeRealIncarnationExitFixture(root);
+		setLifecycleCommandResolverForTest(broker, () => ({
+			file: process.execPath,
+			args: [fixture, settleMarker],
+		}));
+		setSpawnedChildObserverForTest(broker, child => {
+			retainedChild ??= child;
+			observerInvocations += 1;
+			// The fixture publishes its released rollback receipt before it parks, so
+			// waiting for that exact marker makes the throw deterministic instead of
+			// racing the production failure artifact.
+			const idle = new Int32Array(new SharedArrayBuffer(4));
+			const until = Date.now() + 15_000;
+			while (!syncFs.existsSync(settleMarker) && Date.now() < until) Atomics.wait(idle, 0, 0, 5);
+			throw new Error("spawn observer refused this child");
+		});
+		await broker.start();
+		const response = await broker.handleRequest(
+			"session.create",
+			{ cwd: root, readiness: "deferred", readinessTimeoutMs: 6_000 },
+			"observer-throw-teardown",
+		);
+		expect(observerInvocations).toBe(1);
+		expect(retainedChild?.pid).toBeGreaterThan(0);
+		expect(syncFs.existsSync(settleMarker)).toBe(true);
+		// Full authority was already owned when the seam threw, so this is a proven
+		// rollback rather than stranded ownership.
+		expect(response).toMatchObject({ ok: false, error: { code: "spawn_failed", endpoint: "unavailable" } });
+		expect(JSON.stringify(response)).toContain("cleanupProof");
+		expect(response).toMatchObject({
+			startupFailure: {
+				cleanupProof: { processExited: true, endpointRemoved: true },
+			},
+		});
+		// The exact retained handle proves the child was signalled and reaped.
+		expect(retainedChild?.exitCode === null && retainedChild?.signalCode === null).toBe(false);
+		expect(await broker.handleRequest("session.list", {})).toMatchObject({
+			ok: true,
+			result: { sessions: [] },
+		});
+		const sdkDir = path.join(root, ".gjc", "state", "sdk");
+		expect((await fs.readdir(sdkDir).catch(() => [])).filter(name => !name.startsWith("."))).toEqual([]);
+		const rows = await readLifecycleLedgerRows(agentDir);
+		for (const identity of new Set(rows.map(row => row.identity)))
+			expect(rows.filter(row => row.identity === identity && FINAL_LEDGER_STATES.has(row.state))).toHaveLength(1);
+		expect(rows.some(row => row.state === "terminal_uncertain")).toBe(false);
+		expect(
+			await fs.stat(path.join(agentDir, "sdk", "lifecycle-ledger.jsonl.corrupt")).catch(() => undefined),
+		).toBeUndefined();
+	} catch (error) {
+		failures.push(error);
+	} finally {
+		setProcessIncarnationForTest(broker, undefined);
+		setLifecycleCommandResolverForTest(broker, undefined);
+		setSpawnedChildObserverForTest(broker, undefined);
+		const teardown = await settleRetainedFixtureChild(retainedChild);
+		// Production already settled this exact child, so teardown has nothing to kill.
+		if (teardown.outcome !== "already_exited")
+			failures.push(
+				new Error(
+					`Observer-throw teardown had to settle the exact child itself: ${teardown.outcome} (${teardown.diagnostics.join("; ")})`,
+				),
+			);
+		await broker.stop();
+		const preserved = await releaseRetainedFixtureRoot(teardown, root);
+		if (preserved) failures.push(preserved);
+	}
+	if (failures.length === 1) throw failures[0];
+	if (failures.length > 1) throw new AggregateError(failures, "observer-throw teardown failed");
+}, 60_000);

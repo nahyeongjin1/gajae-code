@@ -17,6 +17,7 @@ import {
 	createFixtureBrokerEnvironment,
 	createFixtureRootCleanup,
 	type FixtureRootCleanup,
+	fixtureRootForTest,
 	registerFixtureRuntime,
 	withFixtureBrokerEnvironment,
 } from "./helpers/fixture-broker-cleanup";
@@ -31,10 +32,18 @@ afterEach(async () => {
 	delete process.env.GJC_NOTIFICATIONS;
 	resetSettingsForTest();
 	vi.restoreAllMocks();
-	if (fixtureCleanup) await cleanupFixtureRoot(fixtureCleanup);
+	const owned = fixtureCleanup;
+	// Released before the cleanup runs: a cleanup that throws must not leave this
+	// suite's state pointing at a settled root, or the next test's teardown would
+	// retry that stale root instead of settling its own broker and session host.
 	fixtureCleanup = undefined;
 	authStorage = undefined;
 	tempDir = undefined;
+	if (owned) await cleanupFixtureRoot(owned);
+	// `cleanupFixtureRoot` verifies its own lease close, runtime disposal, root
+	// removal, and sustained root absence, so a surviving broker or session host
+	// fails here rather than escaping the suite.
+	expect(fixtureRootForTest(owned?.root ?? "")).toBeUndefined();
 });
 
 test("model.set executes every Q10-advertised selection and persists the public current readback", async () => {

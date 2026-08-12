@@ -41,10 +41,15 @@ export type ChatDaemonAction = "stop" | "reload";
  * through shared notification parsing. Generation 17 bound managed-session
  * replacement to exact native filesystem authority; generation 18 retired that
  * binding, and generation 19 binds exact cleanup to parent/link-count authority.
+ * Generation 20 introduced the in-place operator command channel. Generation 21
+ * changes it again: every terminal settlement must be provably durable before
+ * its answer is published, and the mapping commit is bracketed by a two-sided
+ * authority fence, so an owner at an earlier generation may not serve or answer
+ * a request captured against this contract.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 20,
-	slack: 20,
+	discord: 21,
+	slack: 21,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {
@@ -266,6 +271,15 @@ export function chatDaemonPaths(
 		state: path.join(dir, "state.json"),
 		control: path.join(dir, "control.json"),
 	};
+}
+
+/**
+ * Configuration fingerprint that identifies which settings a daemon owner was
+ * started for. `undefined` means the current settings cannot configure that
+ * transport at all, so no owner can be authorized against them.
+ */
+export function chatDaemonIdentity(settings: Settings, kind: ChatDaemonKind): string | undefined {
+	return identityFor(settings, kind);
 }
 
 function identityFor(settings: Settings, kind: ChatDaemonKind): string | undefined {

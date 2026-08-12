@@ -167,6 +167,111 @@ describe("SlackLiveProvider fake Socket Mode protocol", () => {
 		expect(fixture.requests[0]?.init?.body).toContain("client_msg_id");
 	});
 
+	it("sends Web API calls as Slack-compatible form encoding and omits undefined values", async () => {
+		const fixture = setup([
+			response({ ok: true, messages: [] }),
+			response({ ok: true, messages: [{ ts: "2.0", client_msg_id: "client-1" }] }),
+		]);
+		await expect(
+			fixture.provider.findMessageByClientMsgId({ channel: "C1", threadTs: "0.0", clientMsgId: "client-1" }),
+		).resolves.toEqual({ channel: "C1", ts: "2.0", client_msg_id: "client-1" });
+		const replies = fixture.requests[1];
+		expect(replies?.url).toBe("https://slack.com/api/conversations.replies");
+		expect(new Headers(replies?.init?.headers).get("content-type")).toBe(
+			"application/x-www-form-urlencoded; charset=utf-8",
+		);
+		expect([...new URLSearchParams(String(replies?.init?.body))]).toEqual([
+			["channel", "C1"],
+			["ts", "0.0"],
+		]);
+
+		const posted = setup([response({ ok: true, channel: "C1", ts: "1.0", client_msg_id: "client-1" })]);
+		await posted.provider.postMessage({ channel: "C1", text: "hello world", clientMsgId: "client-1" });
+		expect([...new URLSearchParams(String(posted.requests[0]?.init?.body))]).toEqual([
+			["channel", "C1"],
+			["text", "hello world"],
+			["client_msg_id", "client-1"],
+		]);
+	});
+
+	it("form-encodes existing-root verification through conversations.replies", async () => {
+		const fixture = setup([response({ ok: true, messages: [{ ts: "1700000000.000100", channel: "C1" }] })]);
+		await expect(
+			fixture.provider.findMessageByTimestamp({ channel: "C1", ts: "1700000000.000100" }),
+		).resolves.toEqual({ channel: "C1", ts: "1700000000.000100", client_msg_id: undefined });
+		const request = fixture.requests[0];
+		expect(request?.url).toBe("https://slack.com/api/conversations.replies");
+		expect(new Headers(request?.init?.headers).get("content-type")).toBe(
+			"application/x-www-form-urlencoded; charset=utf-8",
+		);
+		expect([...new URLSearchParams(String(request?.init?.body))]).toEqual([
+			["channel", "C1"],
+			["ts", "1700000000.000100"],
+			["limit", "1"],
+		]);
+	});
+
+	it("escapes reserved and non-ASCII text and separates an empty thread_ts from an absent one", async () => {
+		const text = "a+b & c=d 100% /slash\nnewline 한글 🚀";
+		const fixture = setup([response({ ok: true, channel: "C1", ts: "1.0", client_msg_id: "client-1" })]);
+		await fixture.provider.postMessage({ channel: "C 1", text, threadTs: "0.0", clientMsgId: "client-1" });
+		const body = String(fixture.requests[0]?.init?.body);
+		expect(body).toBe(
+			"channel=C+1&text=a%2Bb+%26+c%3Dd+100%25+%2Fslash%0Anewline+%ED%95%9C%EA%B8%80+%F0%9F%9A%80&thread_ts=0.0&client_msg_id=client-1",
+		);
+		expect([...new URLSearchParams(body)]).toEqual([
+			["channel", "C 1"],
+			["text", text],
+			["thread_ts", "0.0"],
+			["client_msg_id", "client-1"],
+		]);
+
+		const empty = setup([response({ ok: true, channel: "C1", ts: "1.0" })]);
+		await empty.provider.postMessage({ channel: "C1", text: "hello", threadTs: "", clientMsgId: "client-1" });
+		expect(String(empty.requests[0]?.init?.body)).toBe("channel=C1&text=hello&thread_ts=&client_msg_id=client-1");
+
+		const absent = setup([response({ ok: true, channel: "C1", ts: "1.0" })]);
+		await absent.provider.postMessage({ channel: "C1", text: "hello", clientMsgId: "client-1" });
+		expect(String(absent.requests[0]?.init?.body)).toBe("channel=C1&text=hello&client_msg_id=client-1");
+	});
+
+	it("opens Socket Mode with an empty form body instead of a serialized JSON object", async () => {
+		const fixture = setup([response({ ok: true, url: "wss://socket.test" })]);
+		await fixture.provider.start(() => {});
+		const open = fixture.requests[0];
+		expect(open?.url).toBe("https://slack.com/api/apps.connections.open");
+		expect(new Headers(open?.init?.headers).get("content-type")).toBe(
+			"application/x-www-form-urlencoded; charset=utf-8",
+		);
+		expect(open?.init?.body).toBe("");
+		await fixture.provider.stop();
+	});
+
+	it("carries each token in the Authorization header only, never in a form body or typed error", async () => {
+		const fixture = setup([response({ ok: true, url: "wss://socket.test" }), response({ ok: false }, 500)]);
+		await fixture.provider.start(() => {});
+		let error: unknown;
+		try {
+			await fixture.provider.postMessage({ channel: "C1", text: "hello", clientMsgId: "client-1" });
+		} catch (caught) {
+			error = caught;
+		}
+		await fixture.provider.stop();
+		expect(error).toBeInstanceOf(SlackProviderError);
+		expect(error).toMatchObject({ code: "web_api", operation: "chat.postMessage", status: 500 });
+		expect(new Headers(fixture.requests[0]?.init?.headers).get("authorization")).toBe("Bearer xapp-secret");
+		expect(new Headers(fixture.requests[1]?.init?.headers).get("authorization")).toBe("Bearer xoxb-secret");
+		for (const request of fixture.requests) {
+			expect(new Headers(request.init?.headers).get("content-type")).toBe(
+				"application/x-www-form-urlencoded; charset=utf-8",
+			);
+			expect(String(request.init?.body)).not.toContain("xapp-secret");
+			expect(String(request.init?.body)).not.toContain("xoxb-secret");
+		}
+		expect(`${error}`).not.toContain("xoxb-secret");
+		expect(JSON.stringify(error)).not.toContain("xoxb-secret");
+	});
+
 	it("bounds rate-limit retry and exposes no credential in typed errors", async () => {
 		const fixture = setup([
 			response({ ok: false }, 429, { "retry-after": "120" }),

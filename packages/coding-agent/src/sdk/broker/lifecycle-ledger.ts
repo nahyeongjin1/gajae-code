@@ -163,14 +163,90 @@ function pendingCleanupSessionId(response: unknown): string | undefined {
 	return canonicalCleanupSessionId(cleanup?.sessionId) ? cleanup.sessionId : undefined;
 }
 
-function hasCleanupAuthorityShape(response: unknown): boolean {
-	if (!response || typeof response !== "object") return false;
-	const error = (response as { error?: unknown }).error;
-	return Boolean(error && typeof error === "object" && "cleanup" in error);
+/**
+ * Own-property boolean discriminant.
+ *
+ * An `ok` reachable only through the prototype chain is not evidence: it never
+ * survives serialization, so a row that agreed with it in memory would read back
+ * as an opaque payload. A non-boolean `ok` is not the broker's discriminant at
+ * all.
+ */
+function ownBooleanDiscriminant(record: Record<string, unknown>, key: string): boolean | undefined {
+	if (!Object.hasOwn(record, key)) return undefined;
+	const value = record[key];
+	return typeof value === "boolean" ? value : undefined;
+}
+
+/** What a persisted response proves about its own outcome. */
+type LifecycleResponseShape = { kind: "success" } | { kind: "failure"; code: string; cleanupAuthority: boolean };
+
+/**
+ * Classify a persisted response as the exact `BrokerResponse` the broker writes.
+ *
+ * `BrokerResponse` is a two-arm union: `{ok:true, …}` or `{ok:false,
+ * error:{code, message, …}}`. A payload that is neither arm — a missing,
+ * inherited, or non-boolean `ok`, a success that also carries an error, a
+ * failure with a malformed error, an array, `null`, or a primitive — is an
+ * opaque document, not a lifecycle outcome, and can never be normalized into
+ * one.
+ */
+function lifecycleResponseShape(response: unknown): LifecycleResponseShape | undefined {
+	if (typeof response !== "object" || response === null || Array.isArray(response)) return undefined;
+	const record = response as Record<string, unknown>;
+	const ok = ownBooleanDiscriminant(record, "ok");
+	if (ok === undefined) return undefined;
+	if (ok) return record.error === undefined ? { kind: "success" } : undefined;
+	const error = record.error;
+	if (typeof error !== "object" || error === null || Array.isArray(error)) return undefined;
+	const failure = error as Record<string, unknown>;
+	if (typeof failure.code !== "string" || failure.code.length === 0) return undefined;
+	if (typeof failure.message !== "string") return undefined;
+	const cleanup = failure.cleanup;
+	if (cleanup !== undefined && (typeof cleanup !== "object" || cleanup === null || Array.isArray(cleanup)))
+		return undefined;
+	return {
+		kind: "failure",
+		code: failure.code,
+		cleanupAuthority: failure.code === "cleanup_pending" && cleanup !== undefined,
+	};
+}
+
+/**
+ * A row must agree with the response it carries.
+ *
+ * `lifecycleResponseState` is the only mapping the broker ever writes, so this
+ * is its exact inverse: `terminal_ok` means a successful `BrokerResponse`,
+ * `terminal_error` means a definitive failure that is neither uncertainty nor
+ * retained cleanup authority, `terminal_uncertain` carries no response at all or
+ * only a non-success uncertainty/retained-cleanup response, and the single
+ * non-final row that may carry a response is the `effect_started` cleanup fence.
+ *
+ * A row whose state contradicts its own response cannot prove which outcome
+ * happened, and a row carrying an opaque payload cannot prove that any outcome
+ * happened at all. Both are unexplainable history rather than replayable
+ * evidence, so both fail closed everywhere this ledger is read or written.
+ */
+function agreesWithFinalState(entry: LifecycleLedgerEntry): boolean {
+	const shape = lifecycleResponseShape(entry.response);
+	switch (entry.state) {
+		case "terminal_ok":
+			return shape?.kind === "success";
+		case "terminal_error":
+			return shape?.kind === "failure" && !shape.cleanupAuthority && shape.code !== "terminal_uncertain";
+		case "terminal_uncertain":
+			// A retained cleanup fence is the one non-`terminal_uncertain` code an
+			// uncertainty may still carry: it is unresolved cleanup authority the
+			// reconciliation path owns, and it is never a success.
+			if (entry.response === undefined) return true;
+			return shape?.kind === "failure" && (shape.code === "terminal_uncertain" || shape.cleanupAuthority);
+		default:
+			return entry.response === undefined || (shape?.kind === "failure" && shape.cleanupAuthority);
+	}
 }
 
 function hasValidTerminalDigests(entry: LifecycleLedgerEntry): boolean {
 	const response = entry.response as { ok?: unknown; error?: { code?: unknown; cleanup?: unknown } } | undefined;
+	if (!agreesWithFinalState(entry)) return false;
 	const cleanupPendingResponse =
 		response?.ok === false && response.error?.code === "cleanup_pending" && response.error.cleanup !== undefined;
 	const responseDigestRequired =
@@ -201,8 +277,13 @@ function hasValidTerminalDigests(entry: LifecycleLedgerEntry): boolean {
 		const unresolvedResponse = entry.unresolvedCleanupResponse as {
 			error?: { cleanup?: { sessionId?: unknown } };
 		};
+		// Retained cleanup authority is the only thing this field ever holds, so it
+		// is judged by the same broker-response contract as the row's own response.
+		const unresolvedShape = lifecycleResponseShape(entry.unresolvedCleanupResponse);
 		if (
 			entry.unresolvedCleanupResponse === undefined ||
+			unresolvedShape?.kind !== "failure" ||
+			!unresolvedShape.cleanupAuthority ||
 			typeof entry.unresolvedCleanupResponseDigest !== "string" ||
 			unresolvedResponse.error?.cleanup?.sessionId !== entry.intendedSessionId ||
 			entry.unresolvedCleanupResponseDigest !==
@@ -267,6 +348,10 @@ export class LifecycleLedger {
 		const invalidIdentities = new Set<string>();
 		const syntheticUncertain = new Map<string, LifecycleLedgerEntry>();
 		const uncertainAfterCorruption = new Set<string>();
+		// Identities whose durable source already contains a decodable final row —
+		// valid or quarantined. Recovery must never append a second final behind one,
+		// because every later reopen would quarantine that append and add another.
+		const durableFinalIdentities = new Set<string>();
 		const source = await this.#readBoundedSource();
 		let tornTail = false;
 		if (source) {
@@ -294,32 +379,36 @@ export class LifecycleLedger {
 						uncertainAfterCorruption.has(entry.identity) ||
 						!hasValidTerminalDigests(entry) ||
 						!this.#isValidHistoryContinuation(prior, entry);
+					if (final(entry.state)) durableFinalIdentities.add(entry.identity);
 					if (invalidHistory) {
 						await this.#quarantine(line);
 						invalidIdentities.add(entry.identity);
 						if (!syntheticUncertain.has(entry.identity)) {
-							const uncertain = this.#uncertainFrom(prior ?? entry, prior !== undefined);
-							const nestedCleanupSessionId =
-								pendingCleanupSessionId(entry.unresolvedCleanupResponse) ??
-								pendingCleanupSessionId(entry.response) ??
-								entry.intendedSessionId;
-							if (canonicalCleanupSessionId(nestedCleanupSessionId))
-								uncertain.uncertainCleanupSessionId = nestedCleanupSessionId;
+							// Uncertainty synthesized from a quarantined history never inherits a
+							// prior row's response or response digest. A malformed, digest-invalid,
+							// hash-conflicting, or second-final history cannot prove which outcome
+							// actually happened, so replaying the prior success or error would
+							// promote unverified evidence to a caller. Only the identity, its
+							// request hash, and explicit fail-closed cleanup fencing survive.
+							const uncertain = this.#uncertainFrom(prior ?? entry, false);
 							uncertain.uncertainCleanupSessionIds = [
 								entry.intendedSessionId,
 								pendingCleanupSessionId(entry.response),
 								pendingCleanupSessionId(entry.unresolvedCleanupResponse),
-								nestedCleanupSessionId,
+								prior?.intendedSessionId,
+								pendingCleanupSessionId(prior?.response),
+								pendingCleanupSessionId(prior?.unresolvedCleanupResponse),
 							].filter(
 								(candidate, index, candidates): candidate is string =>
 									canonicalCleanupSessionId(candidate) && candidates.indexOf(candidate) === index,
 							);
-							if (
-								hasCleanupAuthorityShape(entry.response) ||
-								hasCleanupAuthorityShape(entry.unresolvedCleanupResponse) ||
-								(entry.state === "terminal_uncertain" && entry.response === undefined)
-							)
-								uncertain.uncertainCleanupAllSessions = true;
+							const [fencedCleanupSessionId] = uncertain.uncertainCleanupSessionIds;
+							if (fencedCleanupSessionId !== undefined)
+								uncertain.uncertainCleanupSessionId = fencedCleanupSessionId;
+							// The discarded response was the only bound on this identity's cleanup
+							// scope, so the fence stays open until reconciliation reads the
+							// quarantined evidence.
+							uncertain.uncertainCleanupAllSessions = true;
 							syntheticUncertain.set(entry.identity, uncertain);
 						}
 						continue;
@@ -328,8 +417,17 @@ export class LifecycleLedger {
 					this.#byIdentity.set(entry.identity, entry);
 				} catch (error) {
 					if (error instanceof Error && "code" in error && error.code === "unsupported_state_version") throw error;
+					// A complete line that cannot be decoded at all is unattributable: it may
+					// be a final row for any identity already present in this source, so every
+					// known identity fails closed, not only the ones that had not reached a
+					// final yet. An identity whose durable history already ends in a final row
+					// gets a sanitized memory-only uncertainty — it carries no response or
+					// digest, so `begin()` cannot replay the prior success, and nothing is
+					// appended behind that durable final for a later reopen to quarantine.
 					for (const [identity, latest] of this.#byIdentity) {
-						if (!final(latest.state)) uncertainAfterCorruption.add(identity);
+						uncertainAfterCorruption.add(identity);
+						if (final(latest.state) && !syntheticUncertain.has(identity))
+							syntheticUncertain.set(identity, this.#uncertainFrom(latest, false));
 					}
 					await this.#quarantine(line);
 				}
@@ -338,6 +436,10 @@ export class LifecycleLedger {
 		if (tornTail) await this.#sealTornTail();
 		for (const [identity, uncertain] of syntheticUncertain) {
 			this.#byIdentity.set(identity, uncertain);
+			// A history that already ends in a durable final row keeps that row: the
+			// fence is memory-only and every reopen re-derives it from the same
+			// quarantined evidence instead of growing a final-after-final chain.
+			if (durableFinalIdentities.has(identity)) continue;
 			if (this.#entries.some(entry => entry.identity === identity && entry.state === "accepted"))
 				await this.#append(uncertain);
 		}
@@ -353,7 +455,12 @@ export class LifecycleLedger {
 		return this;
 	}
 	/**
-	 * Reads terminal proof for one request without recovering or changing the ledger.
+	 * Reads final proof for one request without recovering or changing the ledger.
+	 *
+	 * A durably persisted `terminal_uncertain` row is itself a proven final outcome:
+	 * it must read back as the same uncertainty so a caller verifies its own
+	 * persistence instead of transitioning again and appending a final-after-final
+	 * row that a later reopen would quarantine.
 	 *
 	 * This intentionally accepts an unrelated unterminated final write: concurrent
 	 * appenders may have started a different row after this request's synced terminal
@@ -403,7 +510,7 @@ export class LifecycleLedger {
 			const identityMarker = Buffer.from(`"identity":${JSON.stringify(identity)}`);
 			if (tail.includes(identityMarker)) return undefined;
 		}
-		return latest && terminal(latest.state) ? latest : undefined;
+		return latest && final(latest.state) ? latest : undefined;
 	}
 
 	#isValidHistoryContinuation(previous: LifecycleLedgerEntry | undefined, next: LifecycleLedgerEntry): boolean {
@@ -533,14 +640,63 @@ export class LifecycleLedger {
 			await h.close();
 		}
 	}
-	async #quarantine(line: string | Uint8Array): Promise<void> {
-		const h = await this.#openAppendRegular(this.#corruptFile);
+	/**
+	 * Reads the corrupt sidecar under the same owner-only, regular-file, no-follow,
+	 * bounded contract the writer uses, so retained evidence can be compared without
+	 * ever reading through a swapped symlink or an unbounded file.
+	 *
+	 * An unreadable, oversized, non-regular, or absent sidecar simply withholds
+	 * proof of prior retention; the caller then appends, which re-applies the write
+	 * side of the same contract and still refuses a symlinked target.
+	 */
+	async #readRetainedQuarantine(): Promise<Buffer | undefined> {
+		let handle: fs.FileHandle | undefined;
 		try {
-			await h.writeFile(line);
-			await h.writeFile("\n");
-			await h.sync();
+			handle = await fs.open(this.#corruptFile, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
+			const stat = await handle.stat({ bigint: true });
+			if (!stat.isFile() || stat.size > BigInt(this.#limits.maxBytes)) return undefined;
+			const bytes = Buffer.alloc(Number(stat.size));
+			const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
+			return bytes.subarray(0, bytesRead);
+		} catch {
+			return undefined;
 		} finally {
-			await h.close();
+			if (handle) await handle.close();
+		}
+	}
+
+	/**
+	 * Retains offending bytes exactly once.
+	 *
+	 * Recovery is re-derived from the same durable source on every reopen, so the
+	 * same permanent corruption is presented again and again. Re-retaining evidence
+	 * that is already held byte-identically is a no-op, which keeps a permanently
+	 * corrupt ledger from growing its sidecar without bound. Distinct evidence is
+	 * never suppressed: only an exact, complete, already-retained record is skipped.
+	 */
+	async #quarantine(line: string | Uint8Array): Promise<void> {
+		const record = Buffer.concat([Buffer.from(line), Buffer.from("\n")]);
+		const retained = await this.#readRetainedQuarantine();
+		let alreadyRetained = false;
+		if (retained) {
+			for (let start = 0; start <= retained.length - record.length; ) {
+				const end = retained.indexOf(0x0a, start);
+				if (end === -1) break;
+				if (end + 1 - start === record.length && retained.subarray(start, end + 1).equals(record)) {
+					alreadyRetained = true;
+					break;
+				}
+				start = end + 1;
+			}
+		}
+		if (!alreadyRetained) {
+			const h = await this.#openAppendRegular(this.#corruptFile);
+			try {
+				await h.writeFile(record);
+				await h.sync();
+			} finally {
+				await h.close();
+			}
 		}
 		this.#warnings.push("Malformed lifecycle ledger entry quarantined");
 	}
@@ -710,6 +866,12 @@ export class LifecycleLedger {
 					digest: createHash("sha256").update(canonicalJson(body)).digest("hex"),
 				};
 			}
+			// This ledger is broker outcome evidence, not a generic durable log, so a
+			// row that cannot prove its own outcome is refused at the write boundary
+			// instead of being persisted for a later reader to quarantine. Every read
+			// path applies the same contract, so the two can never disagree.
+			if (!hasValidTerminalDigests(next))
+				throw new Error("Lifecycle ledger refuses a row whose response is not broker outcome evidence.");
 			return this.#append(next);
 		});
 	}

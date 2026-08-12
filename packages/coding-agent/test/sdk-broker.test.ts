@@ -348,6 +348,46 @@ it("SDK lifecycle launch requests require a worktree identity", () => {
 		),
 	).toThrow("GJC_SDK_LIFECYCLE_REQUEST is invalid.");
 });
+/**
+ * Prepared readiness is a broker-issued, session-scoped intent on the launch
+ * request itself. It has exactly two admissible values, an absent field is the
+ * stock immediate contract, and every foreign or malformed value fails closed
+ * rather than being coerced into a preparation the operator never asked for.
+ */
+it("SDK lifecycle launch requests carry a strict prepared-readiness intent", () => {
+	const cwd = "/workspace/repo";
+	const base = {
+		operation: "session.create",
+		sessionId: "session-1",
+		stateRoot: path.join(cwd, ".gjc", "state"),
+		cwd,
+		...deriveLifecycleDeadlines(Date.now(), 10_000),
+	};
+	expect(readSessionLifecycleLaunchRequest(JSON.stringify(base)).readiness).toBeUndefined();
+	expect(readSessionLifecycleLaunchRequest(JSON.stringify({ ...base, readiness: "immediate" })).readiness).toBe(
+		"immediate",
+	);
+	expect(readSessionLifecycleLaunchRequest(JSON.stringify({ ...base, readiness: "deferred" })).readiness).toBe(
+		"deferred",
+	);
+	for (const foreign of ["", "prepared", "Deferred", "deferred ", 1, true, null, {}, ["deferred"]]) {
+		expect(() => readSessionLifecycleLaunchRequest(JSON.stringify({ ...base, readiness: foreign }))).toThrow(
+			"GJC_SDK_LIFECYCLE_REQUEST is invalid.",
+		);
+	}
+	// Preparation is a creation-only intent; a fork or resume may not defer.
+	expect(() =>
+		readSessionLifecycleLaunchRequest(
+			JSON.stringify({
+				...base,
+				operation: "session.resume",
+				sessionPath: "/agent/sessions/session-1.jsonl",
+				sessionIdentity: { dev: "1", ino: "2", size: 3, mtimeMs: 4, mtimeNs: "5", sha256: "a".repeat(64) },
+				readiness: "deferred",
+			}),
+		),
+	).toThrow("GJC_SDK_LIFECYCLE_REQUEST is invalid.");
+});
 it("SDK lifecycle transcript authority requires and preserves a full sha256 identity", () => {
 	const cwd = "/workspace/repo";
 	const request = {
@@ -1847,8 +1887,7 @@ describe("SDK broker identity and discovery", () => {
 				ok: false,
 				error: {
 					code: "terminal_uncertain",
-					message:
-						"Lifecycle terminal evidence could not be verified after persistence; retained artifacts require reconciliation.",
+					message: "Prior cleanup authority for this session is corrupt or incomplete.",
 				},
 			});
 			expect(calls).toBe(1);

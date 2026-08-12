@@ -184,7 +184,9 @@ test("v1 SDK state transforms to a rollback directory and is executable by the p
 	const ledger = await new LifecycleLedger(agentDir).open();
 	const begun = await ledger.begin("rollback-proof", "request-hash");
 	if (begun.kind !== "new") throw new Error("Expected new lifecycle entry");
-	await ledger.transition("rollback-proof", "terminal_ok", { response: { sessionId: "rollback-session" } });
+	await ledger.transition("rollback-proof", "terminal_ok", {
+		response: { ok: true, result: { sessionId: "rollback-session" } },
+	});
 
 	const manifest = (await Bun.file(pretrainManifest).json()) as {
 		baseRef: string;

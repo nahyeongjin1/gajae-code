@@ -1,5 +1,12 @@
-import { describe, expect, test } from "bun:test";
-import { parseNotifyArgs, runNotifyCommand } from "../src/cli/notify-cli";
+import { describe, expect, spyOn, test } from "bun:test";
+import type { CliConfig } from "@gajae-code/utils/cli";
+import {
+	assertStrictActivateThreadInvocation,
+	assertStrictBindThreadInvocation,
+	parseNotifyArgs,
+	runNotifyCommand,
+} from "../src/cli/notify-cli";
+import Notify from "../src/commands/notify";
 import { Settings } from "../src/config/settings";
 import {
 	parseInThreadConfigCommand,
@@ -7,6 +14,8 @@ import {
 	parseTelegramControlCommand,
 	parseToolActivityToggleCommand,
 } from "../src/sdk/bus/config-commands";
+
+const NOTIFY_TEST_CONFIG: CliConfig = { bin: "gjc", version: "0.0.0-test", commands: new Map() };
 
 describe("parseInThreadConfigCommand", () => {
 	test("/verbose and /lean toggle verbosity", () => {
@@ -209,6 +218,248 @@ describe("notify Discord and Slack setup", () => {
 				"parent",
 			]),
 		).toMatchObject({ provider: "discord", discordBotToken: "discord-secret", discordApplicationId: "app" });
+	});
+
+	test("parses an existing Slack thread binding and prints only safe identifiers", async () => {
+		expect(
+			parseNotifyArgs(["notify", "bind-thread", "--session-id", "session-1", "--thread-ts", "1785573662.132329"]),
+		).toMatchObject({
+			action: "bind-thread",
+			sessionId: "session-1",
+			threadTs: "1785573662.132329",
+		});
+		const calls: Array<{ sessionId: string; threadTs: string }> = [];
+		const settings = Settings.isolated({});
+		const written: string[] = [];
+		const write = spyOn(process.stdout, "write").mockImplementation(chunk => {
+			written.push(String(chunk));
+			return true;
+		});
+		try {
+			await runNotifyCommand(
+				{
+					action: "bind-thread",
+					rawArgs: [],
+					sessionId: "session-1",
+					threadTs: "1785573662.132329",
+				},
+				{
+					settings,
+					bindSlackThread: async input => {
+						calls.push({ sessionId: input.sessionId, threadTs: input.threadTs });
+						return {
+							sessionId: input.sessionId,
+							endpointGeneration: 7,
+							teamId: "T1",
+							channelId: "C1",
+							rootTs: input.threadTs,
+							ownerId: "1234-owner",
+							daemonGeneration: 20,
+						};
+					},
+				},
+			);
+		} finally {
+			write.mockRestore();
+		}
+		expect(calls).toEqual([{ sessionId: "session-1", threadTs: "1785573662.132329" }]);
+		const output = written.join("");
+		expect(output).toContain("session-1");
+		expect(output).toContain("T1/C1");
+		expect(output).toContain("1785573662.132329");
+		expect(output).toContain("1234-owner");
+		expect(output).toMatch(/generation/);
+		expect(output).not.toMatch(/xoxb|xapp|token/i);
+	});
+
+	test("refuses bind-thread invocations that carry a Slack target or credential", async () => {
+		expect(
+			parseNotifyArgs([
+				"notify",
+				"bind-thread",
+				"--session-id",
+				"session-1",
+				"--thread-ts",
+				"1785573662.132329",
+				"--slack-workspace-id",
+				"T9",
+			]),
+		).toBeUndefined();
+		expect(
+			parseNotifyArgs([
+				"notify",
+				"bind-thread",
+				"--session-id",
+				"session-1",
+				"--thread-ts",
+				"1785573662.132329",
+				"--slack-bot-token",
+				"xoxb-leak",
+			]),
+		).toBeUndefined();
+		const calls: Array<{ sessionId: string; threadTs: string }> = [];
+		const bindSlackThread = async (input: { sessionId: string; threadTs: string }) => {
+			calls.push({ sessionId: input.sessionId, threadTs: input.threadTs });
+			throw new Error("binding must not be reached");
+		};
+		await expect(
+			runNotifyCommand(
+				{
+					action: "bind-thread",
+					rawArgs: [],
+					sessionId: "session-1",
+					threadTs: "1785573662.132329",
+					slackChannelId: "C9",
+				},
+				{ bindSlackThread },
+			),
+		).rejects.toThrow(/only --session-id and --thread-ts/);
+		await expect(
+			runNotifyCommand(
+				{ action: "bind-thread", rawArgs: ["extra"], sessionId: "session-1", threadTs: "1785573662.132329" },
+				{ bindSlackThread },
+			),
+		).rejects.toThrow(/does not accept additional arguments/);
+		await expect(
+			runNotifyCommand({ action: "bind-thread", rawArgs: [], sessionId: "session-1" }, { bindSlackThread }),
+		).rejects.toThrow(/requires --session-id and --thread-ts/);
+		await expect(
+			runNotifyCommand(
+				{ action: "bind-thread", rawArgs: [], sessionId: "session-1", threadTs: "1785573662" },
+				{ bindSlackThread },
+			),
+		).rejects.toMatchObject({ name: "SlackThreadBindingError", code: "invalid_root" });
+		expect(calls).toEqual([]);
+	});
+
+	test("rejects every bind-thread invocation the real notify command should not accept", async () => {
+		const rejected: string[][] = [
+			["bind-thread"],
+			["bind-thread", "--session-id", "session-1"],
+			["bind-thread", "--thread-ts", "1785573662.132329"],
+			["bind-thread", "--session-id", "session-1", "--thread-ts", "1785573662.132329", "slack"],
+			["bind-thread", "--session-id", "session-1", "--thread-ts", "1785573662.132329", "positional"],
+			["bind-thread", "--session-id", "session-1", "--thread-ts", "1785573662.132329", "--message", "hi"],
+			["bind-thread", "--session-id", "session-1", "--thread-ts", "1785573662.132329", "--redact"],
+			["bind-thread", "--session-id", "session-1", "--thread-ts", "1785573662.132329", "--probe"],
+			["bind-thread", "--session-id", "session-1", "--thread-ts", "1785573662.132329", "--smoke"],
+			["bind-thread", "--session-id", "session-1", "--thread-ts", "1785573662.132329", "--token", "leak"],
+			[
+				"bind-thread",
+				"--session-id",
+				"session-1",
+				"--thread-ts",
+				"1785573662.132329",
+				"--slack-bot-token",
+				"xoxb-leak",
+			],
+			["bind-thread", "--session-id", "session-1", "--thread-ts", "1785573662.132329", "--owner-id", "owner"],
+			["bind-thread", "--session-id", "session-1", "--thread-ts", "1785573662.132329", "--agent-dir", "/tmp"],
+			["bind-thread", "--session-id", "session-1", "--thread-ts", "1785573662"],
+			["bind-thread", "--session-id", "session-1", "--thread-ts", "17855736621323299999999999.1"],
+		];
+		for (const argv of rejected) {
+			await expect(new Notify(argv, NOTIFY_TEST_CONFIG).run()).rejects.toThrow(
+				/notify bind-thread|Slack root timestamp/,
+			);
+		}
+		// Positive control: the gate the command calls accepts the exact grammar, so
+		// the rejections above are attributable to the invocation shape alone.
+		expect(
+			assertStrictBindThreadInvocation({
+				action: "bind-thread",
+				rawArgs: ["--session-id", "session-1", "--thread-ts", "1785573662.132329"],
+				sessionId: "session-1",
+				threadTs: "1785573662.132329",
+				smoke: false,
+				redact: false,
+				probe: false,
+			}),
+		).toEqual({ sessionId: "session-1", threadTs: "1785573662.132329" });
+	});
+
+	test("parses a prepared-session activation and prints only safe identifiers", async () => {
+		expect(parseNotifyArgs(["notify", "activate-thread", "--session-id", "session-1"])).toMatchObject({
+			action: "activate-thread",
+			sessionId: "session-1",
+		});
+		const calls: string[] = [];
+		const written: string[] = [];
+		const write = spyOn(process.stdout, "write").mockImplementation(chunk => {
+			written.push(String(chunk));
+			return true;
+		});
+		try {
+			await runNotifyCommand(
+				{ action: "activate-thread", rawArgs: [], sessionId: "session-1" },
+				{
+					settings: Settings.isolated({}),
+					activatePreparedSession: async input => {
+						calls.push(input.sessionId);
+						return { sessionId: input.sessionId, endpointGeneration: 7, status: "activated" };
+					},
+				},
+			);
+		} finally {
+			write.mockRestore();
+		}
+		expect(calls).toEqual(["session-1"]);
+		const output = written.join("");
+		expect(output).toContain("session-1");
+		expect(output).toContain("activated");
+		expect(output).toMatch(/generation/);
+		expect(output).not.toMatch(/xoxb|xapp|token/i);
+	});
+
+	test("refuses activate-thread invocations that carry anything but a session", async () => {
+		expect(
+			parseNotifyArgs(["notify", "activate-thread", "--session-id", "session-1", "--thread-ts", "1.2"]),
+		).toBeUndefined();
+		const activatePreparedSession = async () => {
+			throw new Error("activation must not be reached");
+		};
+		await expect(
+			runNotifyCommand(
+				{ action: "activate-thread", rawArgs: [], sessionId: "session-1", slackChannelId: "C9" },
+				{ activatePreparedSession },
+			),
+		).rejects.toThrow(/only --session-id/);
+		await expect(
+			runNotifyCommand(
+				{ action: "activate-thread", rawArgs: ["extra"], sessionId: "session-1" },
+				{ activatePreparedSession },
+			),
+		).rejects.toThrow(/does not accept additional arguments/);
+		await expect(
+			runNotifyCommand({ action: "activate-thread", rawArgs: [] }, { activatePreparedSession }),
+		).rejects.toThrow(/requires --session-id/);
+	});
+
+	test("rejects every activate-thread invocation the real notify command should not accept", async () => {
+		const rejected: string[][] = [
+			["activate-thread"],
+			["activate-thread", "--thread-ts", "1785573662.132329"],
+			["activate-thread", "--session-id", "session-1", "positional"],
+			["activate-thread", "--session-id", "session-1", "--thread-ts", "1785573662.132329"],
+			["activate-thread", "--session-id", "session-1", "--message", "hi"],
+			["activate-thread", "--session-id", "session-1", "--slack-bot-token", "xoxb-leak"],
+			["activate-thread", "--session-id", "session-1", "--owner-id", "owner"],
+			["activate-thread", "--session-id", "session-1", "--agent-dir", "/tmp"],
+		];
+		for (const argv of rejected) {
+			await expect(new Notify(argv, NOTIFY_TEST_CONFIG).run()).rejects.toThrow(/notify activate-thread/);
+		}
+		// Positive control: the exact grammar is accepted by the same gate.
+		expect(
+			assertStrictActivateThreadInvocation({
+				action: "activate-thread",
+				rawArgs: ["--session-id", "session-1"],
+				sessionId: "session-1",
+				smoke: false,
+				redact: false,
+				probe: false,
+			}),
+		).toEqual({ sessionId: "session-1" });
 	});
 
 	test("saves complete providers, preserves unrelated settings, rejects partial config, and masks status tokens", async () => {

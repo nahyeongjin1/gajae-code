@@ -6,6 +6,7 @@ import type { AgentToolContext } from "@gajae-code/agent-core";
 import { getBundledModel } from "@gajae-code/ai";
 import { validateToolArguments } from "@gajae-code/ai/utils/validation";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
+import { getAgentDir } from "@gajae-code/utils";
 import { Settings } from "../src/config/settings";
 import { createDeepInterviewIntentManifest } from "../src/gjc-runtime/deep-interview-state";
 import { activeEntryPath, modeStatePath, sessionStateDir } from "../src/gjc-runtime/session-layout";
@@ -19,11 +20,13 @@ import {
 } from "../src/modes/shared/agent-wire/workflow-gate-broker";
 import type { WorkflowGate } from "../src/modes/shared/agent-wire/workflow-gate-types";
 import { initTheme } from "../src/modes/theme/theme";
+import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../src/session/messages";
 import { SessionManager } from "../src/session/session-manager";
 import { getSkillActiveStatePaths, syncSkillActiveState } from "../src/skill-state/active-state";
 import { registerWorkflowGateEmitterListener } from "../src/tools/ask-answer-registry";
+import { settleFixtureBrokerWithOwner } from "./helpers/owned-children";
 
 function attachTerminalController(emitter: WorkflowGateEmitter): void {
 	emitter.registerGateTerminalController?.({
@@ -33,13 +36,100 @@ function attachTerminalController(emitter: WorkflowGateEmitter): void {
 }
 
 /**
+ * An isolated `Settings` bound to one fixture's own temp agent directory.
+ *
+ * `Settings.isolated()` takes no agent-directory option and falls back to the
+ * process-global `getAgentDir()`. A fixture that hands it to `createAgentSession`
+ * therefore lets the notification runtime resolve the *ambient* agent directory
+ * — a developer's real `.gjc/agent` — spawn a detached broker there, and append
+ * `host_registered`/`host_unregistered` to that live session index, no matter
+ * which `agentDir` the fixture passed alongside it. Binding `getAgentDir` to the
+ * fixture's own temp root is what keeps every index, broker, and destination
+ * this suite touches inside the directory it also tears down.
+ */
+function isolatedSettingsAt(agentDir: string, overrides: Partial<Record<string, unknown>> = {}): Settings {
+	const settings = Settings.isolated(overrides as never);
+	return new Proxy(settings, {
+		get(target, property) {
+			if (property === "getAgentDir") return () => agentDir;
+			const value = Reflect.get(target, property, target);
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	}) as Settings;
+}
+
+/**
+ * Every session this suite's fixtures registered into the *ambient* agent
+ * index, identified by the temp repo each row locates.
+ *
+ * A fixture that resolves the process-global agent directory does not fail
+ * loudly — it silently appends `host_registered`/`host_unregistered` rows to a
+ * developer's live SDK session index and spawns a detached broker beside it.
+ * Reading back only the rows whose locator is one of this suite's own temp
+ * roots keeps the assertion exact and immune to whatever an unrelated live
+ * daemon writes to the same file.
+ */
+function ambientRegistrationsFor(repos: readonly string[]): string[] {
+	let raw: string;
+	try {
+		raw = fs.readFileSync(path.join(getAgentDir(), "sdk", "sessions", "index.jsonl"), "utf8");
+	} catch {
+		return [];
+	}
+	return raw
+		.split("\n")
+		.flatMap(line => {
+			if (!line.trim()) return [];
+			let row: { type?: unknown; locator?: { repo?: unknown } };
+			try {
+				row = JSON.parse(line) as { type?: unknown; locator?: { repo?: unknown } };
+			} catch {
+				return [];
+			}
+			const repo = row.locator?.repo;
+			return typeof repo === "string" && repos.includes(repo) ? [`${String(row.type)} ${repo}`] : [];
+		})
+		.sort();
+}
+
+/**
  * The SDK-built ToolSession must forward getWorkflowGateEmitter from AgentSession
  * so the real ask tool can emit SDK workflow gates in headless sessions.
  */
 describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 	const tempDirs: string[] = [];
-	afterEach(() => {
-		for (const d of tempDirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
+	afterEach(async () => {
+		// Owner-scoped: only this suite's own fixture roots, each released even when
+		// an earlier one fails, and every one asserted settled before the next test.
+		const owned = tempDirs.splice(0);
+		const failures: unknown[] = [];
+		const unsettled: string[] = [];
+		for (const dir of owned) {
+			// A session hosted against this temp root spawns a detached broker there.
+			// `session.dispose()` releases the host, not that broker, so the ensure
+			// owner is this process's retained handle over it — and the proof that a
+			// broker was launched here at all. The identity is captured before that
+			// owner stops, because stopping it removes the discovery record that names
+			// the process, and the directory is removed only after both.
+			const owner = brokerOwnerForTest(dir);
+			const settled = await settleFixtureBrokerWithOwner(dir, {
+				launched: owner !== undefined,
+				owner: async () => void (await owner?.stop()),
+			});
+			if (settled.problem) unsettled.push(settled.problem);
+			failures.push(...settled.failures);
+			try {
+				fs.rmSync(dir, { recursive: true, force: true });
+			} catch (error) {
+				failures.push(error);
+			}
+		}
+		expect(unsettled).toEqual([]);
+		// Hermeticity, asserted rather than assumed: no fixture reached the ambient
+		// agent directory's session index for any root this suite owned.
+		expect(ambientRegistrationsFor(owned)).toEqual([]);
+		expect(owned.filter(dir => fs.existsSync(dir))).toEqual([]);
+		if (failures.length > 0) throw new AggregateError(failures, "Workflow gate fixture teardown failed.");
 	});
 
 	it("makes the real ask tool emit a workflow_gate when an emitter is attached to the session", async () => {
@@ -50,7 +140,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			cwd: tempDir,
 			agentDir: tempDir,
 			sessionManager: SessionManager.inMemory(),
-			settings: Settings.isolated(),
+			settings: isolatedSettingsAt(tempDir),
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			hasUI: true,
 			disableExtensionDiscovery: true,
@@ -107,7 +197,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			cwd: tempDir,
 			agentDir: tempDir,
 			sessionManager: SessionManager.inMemory(),
-			settings: Settings.isolated(),
+			settings: isolatedSettingsAt(tempDir),
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			hasUI: false,
 			disableExtensionDiscovery: true,
@@ -167,7 +257,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			cwd: tempDir,
 			agentDir: tempDir,
 			sessionManager: SessionManager.inMemory(),
-			settings: Settings.isolated(),
+			settings: isolatedSettingsAt(tempDir),
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			hasUI: false,
 			disableExtensionDiscovery: true,
@@ -208,7 +298,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			cwd: tempDir,
 			agentDir: tempDir,
 			sessionManager: SessionManager.inMemory(),
-			settings: Settings.isolated(),
+			settings: isolatedSettingsAt(tempDir),
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			hasUI: false,
 			disableExtensionDiscovery: true,
@@ -240,7 +330,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			cwd: tempDir,
 			agentDir: tempDir,
 			sessionManager: SessionManager.inMemory(),
-			settings: Settings.isolated(),
+			settings: isolatedSettingsAt(tempDir),
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			hasUI: false,
 			disableExtensionDiscovery: true,
@@ -273,7 +363,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 	it("restores ask for durable workflow state without carrying it into a fresh session", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-g011-workflow-resume-"));
 		tempDirs.push(tempDir);
-		const settings = Settings.isolated({ "mcp.discoveryMode": "mcp-only" });
+		const settings = isolatedSettingsAt(tempDir, { "mcp.discoveryMode": "mcp-only" });
 		const sessionManager = SessionManager.create(tempDir, tempDir);
 		await sessionManager.ensureOnDisk();
 		const originalSessionFile = sessionManager.getSessionFile();
@@ -339,7 +429,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			cwd: tempDir,
 			agentDir: tempDir,
 			sessionManager: resumedManager,
-			settings: Settings.isolated({ "mcp.discoveryMode": "mcp-only" }),
+			settings: isolatedSettingsAt(tempDir, { "mcp.discoveryMode": "mcp-only" }),
 			authStorage: resumedAuthStorage,
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			hasUI: false,
@@ -454,7 +544,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			cwd: tempDir,
 			agentDir: tempDir,
 			sessionManager,
-			settings: Settings.isolated({ "mcp.discoveryMode": "mcp-only" }),
+			settings: isolatedSettingsAt(tempDir, { "mcp.discoveryMode": "mcp-only" }),
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			hasUI: false,
 			disableExtensionDiscovery: true,
@@ -524,7 +614,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			cwd: tempDir,
 			agentDir: tempDir,
 			sessionManager,
-			settings: Settings.isolated({ "mcp.discoveryMode": "mcp-only" }),
+			settings: isolatedSettingsAt(tempDir, { "mcp.discoveryMode": "mcp-only" }),
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			hasUI: false,
 			disableExtensionDiscovery: true,
@@ -547,7 +637,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			cwd: tempDir,
 			agentDir: tempDir,
 			sessionManager: SessionManager.inMemory(),
-			settings: Settings.isolated(),
+			settings: isolatedSettingsAt(tempDir),
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			hasUI: false,
 			disableExtensionDiscovery: true,
@@ -574,7 +664,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			cwd: tempDir,
 			agentDir: tempDir,
 			sessionManager: SessionManager.inMemory(),
-			settings: Settings.isolated(),
+			settings: isolatedSettingsAt(tempDir),
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			hasUI: false,
 			disableExtensionDiscovery: true,
@@ -616,7 +706,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			cwd: tempDir,
 			agentDir: tempDir,
 			sessionManager: SessionManager.inMemory(),
-			settings: Settings.isolated(),
+			settings: isolatedSettingsAt(tempDir),
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			hasUI: false,
 			disableExtensionDiscovery: true,
@@ -666,7 +756,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			cwd: tempDir,
 			agentDir: tempDir,
 			sessionManager: SessionManager.inMemory(tempDir),
-			settings: Settings.isolated(),
+			settings: isolatedSettingsAt(tempDir),
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			hasUI: false,
 			disableExtensionDiscovery: true,
@@ -687,7 +777,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			cwd: tempDir,
 			agentDir: tempDir,
 			sessionManager: persistentManager,
-			settings: Settings.isolated(),
+			settings: isolatedSettingsAt(tempDir),
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			hasUI: false,
 			disableExtensionDiscovery: true,
@@ -712,9 +802,15 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 		tempDirs.push(tempDir);
 		const sessionManager = SessionManager.create(tempDir, tempDir);
 		const targetSessionManager = SessionManager.create(tempDir, tempDir);
-		await targetSessionManager.ensureOnDisk();
-		const targetSessionFile = targetSessionManager.getSessionFile();
-		await targetSessionManager.close();
+		let targetSessionFile: string | undefined;
+		try {
+			await targetSessionManager.ensureOnDisk();
+			targetSessionFile = targetSessionManager.getSessionFile();
+		} finally {
+			// The successor transcript's own handle is released even when persisting
+			// it throws, so a failed setup cannot strand an open session file.
+			await targetSessionManager.close();
+		}
 		if (!targetSessionFile) throw new Error("Expected persisted successor session");
 		const settings = await Settings.loadForScope({ cwd: tempDir, agentDir: tempDir });
 		const { session } = await createAgentSession({
@@ -751,8 +847,16 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			const stopListening = registerWorkflowGateEmitterListener(previousSessionId, emitter => {
 				oldEndpointEmitter = emitter;
 			});
-			expect(await session.switchSession(targetSessionFile)).toBe(true);
-			stopListening();
+			let switched: boolean;
+			try {
+				switched = await session.switchSession(targetSessionFile);
+			} finally {
+				// The listener is registered against a process-global emitter
+				// registry keyed by session id; a throwing switch must not leave this
+				// suite's callback attached for a later test to observe.
+				stopListening();
+			}
+			expect(switched).toBe(true);
 
 			const successorEmitter = session.getWorkflowGateEmitter()!;
 			expect(session.sessionId).not.toBe(previousSessionId);
@@ -795,7 +899,7 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			cwd: tempDir,
 			agentDir: tempDir,
 			sessionManager: SessionManager.create(tempDir, tempDir),
-			settings: Settings.isolated(),
+			settings: isolatedSettingsAt(tempDir),
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			hasUI: false,
 			disableExtensionDiscovery: true,

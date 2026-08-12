@@ -8,7 +8,7 @@ import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { NotificationServer } from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
 import { ModelRegistry } from "../src/config/model-registry";
-import { Settings } from "../src/config/settings";
+import { resetSettingsForTest, Settings } from "../src/config/settings";
 import { ExtensionRunner } from "../src/extensibility/extensions/runner";
 import type {
 	ExtensionActions,
@@ -43,7 +43,11 @@ import { SessionIndex } from "../src/sdk/broker/session-index";
 import { createNotificationsExtension, formatPromptSettlementDiagnostic, PresentationArbiter } from "../src/sdk/bus";
 import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
 import { getNotificationConfig } from "../src/sdk/bus/config";
+import { ConversationStore } from "../src/sdk/bus/conversation-store";
 import { NotificationSessionController } from "../src/sdk/bus/session-control";
+import type { SlackConversation } from "../src/sdk/bus/slack-conversation";
+import { SlackNotificationDaemon } from "../src/sdk/bus/slack-daemon";
+import { SlackProvider } from "../src/sdk/bus/slack-provider";
 import * as telegramDaemon from "../src/sdk/bus/telegram-daemon";
 import { SessionSdkHost } from "../src/sdk/host";
 import {
@@ -69,9 +73,18 @@ type SdkPermissionProvider =
 
 const dirs: string[] = [];
 const sockets: WebSocket[] = [];
+/**
+ * Every agent/index authority this suite handed to a fixture. Each one can own
+ * a spawned broker, so teardown must settle them by their exact directory key
+ * rather than by the session cwd that happens to contain them.
+ */
+const fixtureAgentDirs = new Set<string>();
 afterEach(async () => {
 	await Promise.all(sockets.splice(0).map(closeSocket));
-	for (const dir of dirs) await brokerOwnerForTest(dir)?.stop();
+	// Owner-scoped: stop exactly the brokers this suite's own fixtures created.
+	for (const dir of [...dirs, ...fixtureAgentDirs]) await brokerOwnerForTest(dir)?.stop();
+	const unsettled = [...dirs, ...fixtureAgentDirs].filter(dir => brokerOwnerForTest(dir) !== undefined);
+	fixtureAgentDirs.clear();
 	if (process.platform === "win32") {
 		Bun.gc(true);
 		await Bun.sleep(50);
@@ -82,6 +95,8 @@ afterEach(async () => {
 	delete process.env.GJC_LIFECYCLE_TEST_TOKEN;
 	delete process.env.GJC_LIFECYCLE_TEST_SECRET;
 	delete process.env.GJC_LIFECYCLE_TEST_API_KEY;
+	// A retained owner is a broker child this suite would leak past teardown.
+	expect(unsettled).toEqual([]);
 });
 
 async function waitFor(predicate: () => boolean, label: string): Promise<void> {
@@ -130,6 +145,7 @@ function start(
 		onRegistered?: (registration: telegramDaemon.RegisterNotificationRootResult) => void;
 	}) => Promise<"attached">,
 	controller?: NotificationSessionController,
+	ensureProviderDaemon?: (provider: "discord" | "slack", settings: Settings) => Promise<unknown>,
 ): Map<string, (event: unknown, context: unknown) => unknown> {
 	const handlers = new Map<string, (event: unknown, context: unknown) => unknown>();
 	const api = {
@@ -157,15 +173,64 @@ function start(
 		},
 	} as never;
 	if (lifecycle) attachLifecycleStartupCapability(api, lifecycle.startupCapability);
+	// An unsupplied settings authority is not "no authority": the extension falls
+	// back to the process-global `Settings` singleton, and `startSession` then
+	// resolves its agent directory, spawns its broker, registers into its session
+	// index, and reads its chat credentials from whatever that ambient singleton
+	// points at — a developer's real `.gjc/agent` under a full-repo run. Every
+	// fixture therefore supplies its own explicit, notification-free authority.
 	const effectiveSettings =
 		settings ??
-		(lifecycle ? ({ get: () => undefined, getAgentDir: () => ctx.cwd } as unknown as Settings) : undefined);
-	createNotificationsExtension(
-		api,
-		effectiveSettings ? { settings: effectiveSettings, ensureTelegramDaemon, controller } : undefined,
-	);
+		(lifecycle
+			? ({
+					get: () => undefined,
+					getAgentDir: () => fixtureAgentAuthority(String(ctx.cwd)),
+				} as unknown as Settings)
+			: hermeticFixtureSettings());
+	createNotificationsExtension(api, {
+		settings: effectiveSettings,
+		ensureTelegramDaemon,
+		controller,
+		ensureProviderDaemon,
+	});
 	if (autoStart) void handlers.get("session_start")?.({ type: "session_start" }, ctx);
 	return handlers;
+}
+
+/**
+ * Record the temp agent/index authority a fixture is about to host against.
+ *
+ * `ensure.ts` keys its detached-broker owner map by exact agent directory, so a
+ * fixture whose broker lives under `<cwd>/agent` is not settled by a teardown
+ * that only knows `<cwd>`. Every settings factory routes its `getAgentDir`
+ * through here at the moment the authority is granted, which is what lets
+ * `afterEach` stop exactly the brokers this suite caused to exist and assert
+ * that none was retained.
+ */
+function fixtureAgentAuthority(agentDir: string): string {
+	fixtureAgentDirs.add(agentDir);
+	return agentDir;
+}
+
+/**
+ * The explicit authority for a fixture that supplied none. Notifications are
+ * disabled with no Discord/Slack/Telegram destination, and no agent directory
+ * is granted at all: `startSession` spawns a broker and appends `host_registered`
+ * to a session index only when its settings report one, and these fixtures
+ * assert host wiring rather than registration. Withholding index authority is
+ * strictly stronger than lending a temp one, and unlike the ambient singleton it
+ * can never resolve to a real `.gjc/agent`. A fixture that does need an index
+ * passes its own temp `getAgentDir`.
+ */
+function hermeticFixtureSettings(): Settings {
+	const settings = Settings.isolated({ "notifications.enabled": false });
+	return new Proxy(settings, {
+		get(target, property) {
+			if (property === "getAgentDir") return () => undefined;
+			const value = Reflect.get(target, property, target);
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	}) as Settings;
 }
 
 function telegramSettings(agentDir: string, configured: boolean): Settings {
@@ -177,11 +242,57 @@ function telegramSettings(agentDir: string, configured: boolean): Settings {
 	}) as Settings;
 	return new Proxy(settings, {
 		get(target, prop) {
-			if (prop === "getAgentDir") return () => agentDir;
+			if (prop === "getAgentDir") return () => fixtureAgentAuthority(agentDir);
 			const value = Reflect.get(target, prop, target);
 			return typeof value === "function" ? value.bind(target) : value;
 		},
 	}) as Settings;
+}
+
+/** Settings with a fully configured Slack notification target and a fixed agent dir. */
+function slackSettings(agentDir: string, configured: boolean): Settings {
+	const settings = Settings.isolated({
+		"notifications.enabled": true,
+		...(configured
+			? {
+					"notifications.slack.botToken": "xoxb-fixture",
+					"notifications.slack.appToken": "xapp-fixture",
+					"notifications.slack.workspaceId": "T1",
+					"notifications.slack.channelId": "C1",
+				}
+			: {}),
+	}) as Settings;
+	return new Proxy(settings, {
+		get(target, prop) {
+			if (prop === "getAgentDir") return () => fixtureAgentAuthority(agentDir);
+			const value = Reflect.get(target, prop, target);
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	}) as Settings;
+}
+
+/** A Slack workspace double that records publications and verifies seeded roots. */
+function fakeSlackWorkspace() {
+	const posts: Array<{ channel: string; text: string; threadTs?: string }> = [];
+	const roots = new Map<string, string>();
+	return {
+		posts,
+		seedRoot: (channel: string, ts: string) => roots.set(ts, channel),
+		rootPosts: () =>
+			posts.filter(post => post.threadTs === undefined).map(({ channel, text }) => ({ channel, text })),
+		start: async () => {},
+		stop: async () => {},
+		ack: async () => {},
+		postMessage: async (input: { channel: string; text: string; threadTs?: string; clientMsgId: string }) => {
+			posts.push({ channel: input.channel, text: input.text, threadTs: input.threadTs });
+			const ts = `9.${posts.length}`;
+			roots.set(ts, input.channel);
+			return { channel: input.channel, ts, client_msg_id: input.clientMsgId };
+		},
+		findMessageByClientMsgId: async () => null,
+		findMessageByTimestamp: async (input: { channel: string; ts: string }) =>
+			roots.get(input.ts) === input.channel ? { channel: input.channel, ts: input.ts } : null,
+	};
 }
 
 function context(
@@ -851,6 +962,186 @@ test("lifecycle startup settles native capability incompatibility before constru
 	}
 });
 
+/**
+ * Existing-thread preparation exists only so a daemon-owned Slack binding can
+ * claim the root before readiness. Without a configured Slack target there is
+ * no bind authority, so a prepared session there would be activatable with no
+ * binding at all — the exact ordering the prepare phase exists to remove.
+ */
+test("broker-issued existing-thread preparation fails closed when no Slack bind authority is configured", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prepare-unbindable-"));
+	dirs.push(cwd);
+	const sessionId = `prepare-unbindable-${Date.now()}`;
+	delete process.env.GJC_NOTIFICATIONS;
+	const capability = new SdkStartupCapability(new SdkStartupRollbackTracker(), "deferred");
+	start(context(cwd, sessionId), slackSettings(path.join(cwd, "agent"), false), () => {}, false, new Map(), {
+		startupCapability: capability,
+		lifecycleRequired: true,
+	});
+
+	const result = await capability.promise;
+	expect(result).toMatchObject({ status: "failed", failure: { phase: "startup", reason: "failed" } });
+	if (result.status !== "failed") throw new Error("Expected a fail-closed prepared startup.");
+	expect(result.failure.message).toContain("Slack");
+	// No endpoint is published at all, so this session can never publish
+	// readiness, be notified on, or have a root created for it.
+	expect(fs.existsSync(path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`))).toBe(false);
+}, 60_000);
+
+test("a configured Slack target prepares the session and refuses activation until its root is bound", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prepare-bindable-"));
+	dirs.push(cwd);
+	const agentDir = path.join(cwd, "agent");
+	const sessionId = `prepare-bindable-${Date.now()}`;
+	const rootTs = "1785573662.132329";
+	delete process.env.GJC_NOTIFICATIONS;
+	const capability = new SdkStartupCapability(new SdkStartupRollbackTracker(), "deferred");
+	const workspace = fakeSlackWorkspace();
+	workspace.seedRoot("C1", rootTs);
+	const sessionContext = context(cwd, sessionId);
+	const handlers = start(
+		sessionContext,
+		slackSettings(agentDir, true),
+		() => {},
+		false,
+		new Map(),
+		{ startupCapability: capability, lifecycleRequired: true },
+		true,
+		undefined,
+		undefined,
+		async () => undefined,
+	);
+	const daemon = new SlackNotificationDaemon({
+		agentDir,
+		repo: cwd,
+		teamId: "T1",
+		channelId: "C1",
+		provider: new SlackProvider(workspace),
+		createClient: () => ({ send() {} }),
+		resolveEndpoint: async id => ({
+			sessionId: id,
+			url: "ws://127.0.0.1:1",
+			token: "endpoint-token",
+			path: "",
+			generation: 1,
+		}),
+	});
+	try {
+		await expect(capability.promise).resolves.toEqual({ status: "started" });
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "prepared SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		const replay = async (id: string): Promise<Array<Record<string, unknown>>> => {
+			socket.send(JSON.stringify({ type: "event_replay", id, sinceGeneration: 1, sinceSeq: 0 }));
+			await waitFor(
+				() => frames.some(frame => frame.type === "event_replay_result" && frame.id === id),
+				`${id} replay`,
+			);
+			return (frames.find(frame => frame.type === "event_replay_result" && frame.id === id)?.events ?? []) as Array<
+				Record<string, unknown>
+			>;
+		};
+		const activate = async (id: string): Promise<Record<string, unknown>> => {
+			socket.send(JSON.stringify({ type: "session_activate", id, sessionId, endpointGeneration: 1 }));
+			await waitFor(
+				() => frames.some(frame => frame.type === "session_activate_result" && frame.id === id),
+				`${id} activation`,
+			);
+			return frames.find(frame => frame.type === "session_activate_result" && frame.id === id)!;
+		};
+
+		// Prepared: the startup signal is the prepared receipt, never readiness.
+		const prepared = await replay("prepared-replay");
+		expect(prepared.filter(event => event.name === "session_prepared")).toHaveLength(1);
+		expect(prepared.filter(event => event.name === "session_ready")).toEqual([]);
+
+		// The daemon-owned bind authority is installed and denies activation.
+		expect(await activate("activate-before-bind")).toMatchObject({
+			ok: false,
+			status: "not_authorized",
+			sessionId,
+		});
+		expect((await replay("still-prepared")).filter(event => event.name === "session_ready")).toEqual([]);
+
+		// The daemon owner adopts the operator's root at this exact generation.
+		await expect(daemon.bindExistingRoot(sessionId, rootTs)).resolves.toMatchObject({
+			state: "active",
+			rootTs,
+			endpointGeneration: 1,
+		});
+		expect(
+			Object.values(
+				(await new ConversationStore<SlackConversation>({ agentDir, kind: "slack" }).load()).conversations,
+			),
+		).toEqual([expect.objectContaining({ state: "active", sessionId, rootTs })]);
+
+		// Activation now publishes exactly one readiness signal, and an exact retry
+		// is answered `already` rather than publishing a second one.
+		expect(await activate("activate-after-bind")).toMatchObject({ ok: true, status: "activated" });
+		expect(await activate("activate-again")).toMatchObject({ ok: true, status: "already" });
+		expect((await replay("ready-replay")).filter(event => event.name === "session_ready")).toHaveLength(1);
+		expect(workspace.rootPosts()).toEqual([]);
+	} finally {
+		await daemon.stop();
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+	}
+}, 60_000);
+
+test("an ordinary session with the same Slack target stays immediately ready and is never prepared", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prepare-absent-"));
+	dirs.push(cwd);
+	const sessionId = `prepare-absent-${Date.now()}`;
+	delete process.env.GJC_NOTIFICATIONS;
+	const capability = new SdkStartupCapability(new SdkStartupRollbackTracker());
+	const sessionContext = context(cwd, sessionId);
+	const handlers = start(
+		sessionContext,
+		slackSettings(path.join(cwd, "agent"), true),
+		() => {},
+		false,
+		new Map(),
+		{ startupCapability: capability, lifecycleRequired: true },
+		true,
+		undefined,
+		undefined,
+		async () => undefined,
+	);
+	try {
+		await expect(capability.promise).resolves.toEqual({ status: "started" });
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "ordinary SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		socket.send(JSON.stringify({ type: "event_replay", id: "ordinary-replay", sinceGeneration: 1, sinceSeq: 0 }));
+		await waitFor(
+			() => frames.some(frame => frame.type === "event_replay_result" && frame.id === "ordinary-replay"),
+			"ordinary replay",
+		);
+		const events = (frames.find(frame => frame.id === "ordinary-replay")?.events ?? []) as Array<
+			Record<string, unknown>
+		>;
+		expect(events.filter(event => event.name === "session_ready")).toHaveLength(1);
+		expect(events.filter(event => event.name === "session_prepared")).toEqual([]);
+	} finally {
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+	}
+}, 60_000);
+
 test("SDK broker registration records an absolute lifecycle scope", async () => {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-locator-"));
 	const cwd = path.relative(process.cwd(), root);
@@ -860,7 +1151,7 @@ test("SDK broker registration records an absolute lifecycle scope", async () => 
 	process.env.GJC_NOTIFICATIONS = "1";
 	start(context(cwd, sessionId), {
 		get: () => undefined,
-		getAgentDir: () => agentDir,
+		getAgentDir: () => fixtureAgentAuthority(agentDir),
 	} as unknown as Settings);
 	try {
 		await waitFor(
@@ -873,6 +1164,83 @@ test("SDK broker registration records an absolute lifecycle scope", async () => 
 		);
 	} finally {
 		await brokerOwnerForTest(agentDir)?.stop();
+	}
+}, 60_000);
+
+/**
+ * Hermeticity regression for the exact global-state leak this suite carried.
+ *
+ * `createNotificationsExtension` resolves the process-global `Settings`
+ * singleton whenever a fixture supplies none, and `startSession` then spawns a
+ * broker, opens a `SessionIndex`, and appends `host_registered` under whatever
+ * agent directory that singleton reports. Under a multi-file `bun test` cohort
+ * one unrelated `Settings.init()` publishes a real singleton for the whole
+ * process, so this suite's fixtures registered into a developer's live agent
+ * index and read its live chat destinations. A canary singleton makes that
+ * fallback executable instead of order-dependent: the default fixture path must
+ * neither read nor write it, while a fixture that owns an explicit temp agent
+ * directory still registers there — so the canary assertions can never pass by
+ * doing nothing at all.
+ */
+test("SDK host fixtures never reach an ambient settings agent directory", async () => {
+	const canaryAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-ambient-canary-agent-"));
+	const defaultCwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-hermetic-default-"));
+	const ownedCwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-hermetic-owned-"));
+	const ownedAgentDir = path.join(ownedCwd, "agent");
+	const defaultId = `hermetic-default-${Date.now()}`;
+	const ownedId = `hermetic-owned-${Date.now()}`;
+	dirs.push(defaultCwd, ownedCwd);
+	const defaultContext = context(defaultCwd, defaultId);
+	const ownedContext = context(ownedCwd, ownedId);
+	// Publish the canary as the one ambient authority any fallback would find.
+	resetSettingsForTest();
+	const ambient = await Settings.init({ cwd: defaultCwd, agentDir: canaryAgentDir });
+	expect(ambient.getAgentDir()).toBe(canaryAgentDir);
+	const canaryEntries = new Set(fs.readdirSync(canaryAgentDir));
+	process.env.GJC_NOTIFICATIONS = "1";
+	const defaultHandlers = start(defaultContext);
+	const ownedHandlers = start(ownedContext, {
+		get: () => undefined,
+		getAgentDir: () => fixtureAgentAuthority(ownedAgentDir),
+	} as unknown as Settings);
+	try {
+		for (const [root, id] of [
+			[defaultCwd, defaultId],
+			[ownedCwd, ownedId],
+		] as const)
+			await waitFor(
+				() => fs.existsSync(path.join(root, ".gjc", "state", "sdk", `${id}.json`)),
+				`hermetic SDK endpoint for ${id}`,
+			);
+		// The owned fixture's registration settling is what proves a fallback had
+		// every opportunity to register too, rather than merely being outrun.
+		await waitFor(
+			() => fs.existsSync(path.join(ownedAgentDir, "sdk", "sessions", "index.jsonl")),
+			"fixture-owned broker registration",
+		);
+
+		// The ambient authority was never read for a destination and never written.
+		expect(fs.existsSync(path.join(canaryAgentDir, "sdk"))).toBe(false);
+		expect(fs.readdirSync(canaryAgentDir).filter(entry => !canaryEntries.has(entry))).toEqual([]);
+		const config = getNotificationConfig(hermeticFixtureSettings() as never);
+		expect(config.enabled).toBe(false);
+		expect(config.slack.channelId).toBeUndefined();
+		expect(config.slack.botToken).toBeUndefined();
+		expect(config.discord.botToken).toBeUndefined();
+		expect(config.botToken).toBeUndefined();
+		expect(config.chatId).toBeUndefined();
+		expect(hermeticFixtureSettings().getAgentDir()).toBeUndefined();
+
+		// All index state that does exist is under the fixture's own temp root.
+		const sessions = (await new SessionIndex(ownedAgentDir).open()).listSessions().sessions;
+		expect(sessions.map(session => session.sessionId)).toEqual([ownedId]);
+	} finally {
+		await defaultHandlers.get("session_shutdown")?.({ type: "session_shutdown" }, defaultContext);
+		await ownedHandlers.get("session_shutdown")?.({ type: "session_shutdown" }, ownedContext);
+		resetSettingsForTest();
+		await brokerOwnerForTest(ownedAgentDir)?.stop();
+		await brokerOwnerForTest(canaryAgentDir)?.stop();
+		await removeTempDir(canaryAgentDir);
 	}
 }, 60_000);
 
@@ -2499,7 +2867,10 @@ for (const eventType of ["session_switch", "session_branch"] as const) {
 		} finally {
 			stop.mockRestore();
 		}
-	});
+		// Real detached broker + session host, exactly like every other host-wiring
+		// fixture in this file: the default 5s budget is a per-test limit, not a
+		// correctness bound, and this pair regularly needs more than it.
+	}, 60_000);
 }
 
 test("SDK host binds session query and control seams and excludes uninstalled resources", async () => {

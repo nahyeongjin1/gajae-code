@@ -6,7 +6,12 @@ import { ChatDeliveryError } from "../src/sdk/bus/chat-daemon-runtime";
 import { ChatEffectJournal } from "../src/sdk/bus/chat-effect-journal";
 import { ConversationStore } from "../src/sdk/bus/conversation-store";
 import type { SlackConversation } from "../src/sdk/bus/slack-conversation";
-import { type SlackEndpoint, SlackEndpointBindingError, SlackNotificationDaemon } from "../src/sdk/bus/slack-daemon";
+import {
+	type SlackEndpoint,
+	SlackEndpointBindingError,
+	SlackNotificationDaemon,
+	SlackThreadBindingError,
+} from "../src/sdk/bus/slack-daemon";
 import { SlackProviderError } from "../src/sdk/bus/slack-live-provider";
 import { SlackProvider, type SlackSocketEnvelope } from "../src/sdk/bus/slack-provider";
 import { SdkClientError } from "../src/sdk/client/client";
@@ -16,6 +21,9 @@ class FakeSlack {
 	acks: string[] = [];
 	posts: Array<{ channel: string; text: string; threadTs?: string; clientMsgId: string }> = [];
 	knownMessages = new Map<string, { channel: string; ts: string; client_msg_id: string }>();
+	knownRoots = new Map<string, string>();
+	failFindByTimestamp = false;
+	findByTimestampCalls = 0;
 	failPost = false;
 	failPostAfterAccept = false;
 	failPostProtocolAfterAccept = false;
@@ -115,6 +123,21 @@ class FakeSlack {
 
 		await this.onFind?.(input.clientMsgId);
 		return this.knownMessages.get(input.clientMsgId) ?? null;
+	}
+
+	/** Model an existing Slack message that already lives in a channel. */
+	seedRoot(channel: string, ts: string): void {
+		this.knownRoots.set(ts, channel);
+	}
+
+	async findMessageByTimestamp(input: {
+		channel: string;
+		ts: string;
+	}): Promise<{ channel: string; ts: string } | null> {
+		this.findByTimestampCalls++;
+		if (this.failFindByTimestamp) throw new SlackProviderError("web_api", "conversations.replies");
+		const channel = this.knownRoots.get(input.ts);
+		return channel === input.channel ? { channel, ts: input.ts } : null;
 	}
 }
 
@@ -229,6 +252,212 @@ function messageEnvelope(
 }
 
 describe("SlackNotificationDaemon fake-provider acceptance", () => {
+	it("adopts an existing root without publishing a replacement and routes raw output into it", async () => {
+		await withDaemon(async (daemon, fake) => {
+			fake.seedRoot("C1", "171.100");
+			const bound = await daemon.bindExistingRoot("session", "171.100");
+			expect(bound).toMatchObject({
+				state: "active",
+				teamId: "T1",
+				channelId: "C1",
+				rootTs: "171.100",
+				sessionId: "session",
+				endpointGeneration: 1,
+			});
+			expect(fake.posts).toEqual([]);
+
+			await daemon.notify("session", "GJC raw output");
+			expect(fake.posts).toEqual([
+				expect.objectContaining({ channel: "C1", threadTs: "171.100", text: "GJC raw output" }),
+			]);
+		});
+	});
+
+	it("routes a structured action reply through an adopted root", async () => {
+		await withDaemon(async (daemon, fake, injected) => {
+			fake.seedRoot("C1", "171.101");
+			await daemon.bindExistingRoot("session", "171.101");
+			await daemon.notify("session", "Choose one", "action-1");
+			expect(fake.posts).toEqual([
+				expect.objectContaining({ channel: "C1", threadTs: "171.101", text: "Choose one" }),
+			]);
+
+			expect(await daemon.handleEnvelope(messageEnvelope("answer", "answer-event", "171.101"))).toBe(true);
+			expect(injected).toEqual([expect.objectContaining({ type: "reply", id: "action-1", answer: "reply" })]);
+		});
+	});
+
+	it("refuses an unverified, foreign-channel, or unreachable root without mutating anything", async () => {
+		await withDaemon(async (daemon, fake, _injected, _setEndpointGeneration, agentDir) => {
+			const stored = async () =>
+				Object.values(
+					(await new ConversationStore<SlackConversation>({ agentDir, kind: "slack" }).load()).conversations,
+				);
+
+			await expect(daemon.bindExistingRoot("session", "171.200")).rejects.toMatchObject({
+				name: "SlackThreadBindingError",
+				code: "root_not_found",
+			});
+			expect(await stored()).toEqual([]);
+
+			fake.seedRoot("C-other", "171.201");
+			await expect(daemon.bindExistingRoot("session", "171.201")).rejects.toMatchObject({
+				name: "SlackThreadBindingError",
+				code: "root_not_found",
+			});
+			expect(await stored()).toEqual([]);
+
+			fake.seedRoot("C1", "171.202");
+			fake.failFindByTimestamp = true;
+			await expect(daemon.bindExistingRoot("session", "171.202")).rejects.toMatchObject({
+				name: "SlackThreadBindingError",
+				code: "provider_unavailable",
+			});
+			expect(await stored()).toEqual([]);
+			expect(fake.posts).toEqual([]);
+		});
+	});
+
+	it("rejects unbounded and malformed root timestamps before reaching provider or store", async () => {
+		await withDaemon(async (daemon, fake) => {
+			const malformed = [
+				"not-a-slack-ts",
+				"1785573662",
+				" 1785573662.132329",
+				"1785573662.132329.1",
+				"",
+				"1785573662.",
+				".132329",
+				`${"9".repeat(13)}.132329`,
+				`1785573662.${"9".repeat(13)}`,
+				"1785573662.1e5",
+				"१७८५.१३२",
+			];
+			for (const threadTs of malformed) {
+				await expect(daemon.bindExistingRoot("session", threadTs)).rejects.toMatchObject({
+					name: "SlackThreadBindingError",
+					code: "invalid_root",
+				});
+			}
+			expect(fake.findByTimestampCalls).toBe(0);
+		});
+	});
+
+	it("makes an exact binding replay idempotent and rejects a second root for the same live session", async () => {
+		await withDaemon(async (daemon, fake) => {
+			fake.seedRoot("C1", "171.102");
+			fake.seedRoot("C1", "171.103");
+			const first = await daemon.bindExistingRoot("session", "171.102");
+			const replay = await daemon.bindExistingRoot("session", "171.102");
+			expect(replay).toEqual(first);
+			await expect(daemon.bindExistingRoot("session", "171.103")).rejects.toMatchObject({
+				name: "SlackThreadBindingError",
+				code: "session_conflict",
+			});
+		});
+	});
+
+	it("allows only one concurrent session to claim an existing root across daemon instances", async () => {
+		await withDaemon(async (daemon, fake, _injected, _setEndpointGeneration, agentDir) => {
+			fake.seedRoot("C1", "171.104");
+			const peer = new SlackNotificationDaemon({
+				agentDir,
+				repo: agentDir,
+				teamId: "T1",
+				channelId: "C1",
+				provider: new SlackProvider(fake),
+				createClient: () => ({ send() {} }),
+				resolveEndpoint: async sessionId => endpoint(sessionId),
+			});
+			try {
+				const results = await Promise.allSettled([
+					daemon.bindExistingRoot("session-a", "171.104"),
+					peer.bindExistingRoot("session-b", "171.104"),
+				]);
+				expect(results.filter(result => result.status === "fulfilled")).toHaveLength(1);
+				const rejection = results.find(result => result.status === "rejected") as PromiseRejectedResult;
+				expect(rejection.reason).toBeInstanceOf(SlackThreadBindingError);
+				expect(rejection.reason).toMatchObject({ code: "root_conflict" });
+			} finally {
+				await peer.stop();
+			}
+		});
+	});
+
+	it("publishes no root when a bind commits between a notification's empty read and its publication", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-bind-race-"));
+		let daemon: SlackNotificationDaemon | undefined;
+		try {
+			const fake = new FakeSlack();
+			fake.seedRoot("C1", "171.300");
+			const releaseLoads = Promise.withResolvers<void>();
+			const loadBlocked = Promise.withResolvers<void>();
+			const barrier: LoadBarrier = {
+				remaining: 0,
+				gate: releaseLoads.promise,
+				onBlocked: () => loadBlocked.resolve(),
+			};
+			daemon = new SlackNotificationDaemon({
+				agentDir,
+				repo: agentDir,
+				teamId: "T1",
+				channelId: "C1",
+				provider: new SlackProvider(fake),
+				store: new BlockingSlackStore(agentDir, barrier),
+				createClient: () => ({ send() {} }),
+				resolveEndpoint: async sessionId => endpoint(sessionId),
+			});
+			// Pause the notification immediately after it observes an empty mapping.
+			barrier.remaining = 1;
+			const notification = daemon.notify("session", "GJC raw output", undefined, 1);
+			await loadBlocked.promise;
+			const bound = await daemon.bindExistingRoot("session", "171.300");
+			releaseLoads.resolve();
+			const delivered = await notification;
+
+			expect(bound.rootTs).toBe("171.300");
+			expect(delivered.rootTs).toBe("171.300");
+			expect(fake.posts.filter(post => post.threadTs === undefined)).toEqual([]);
+			expect(fake.posts).toEqual([
+				expect.objectContaining({ channel: "C1", threadTs: "171.300", text: "GJC raw output" }),
+			]);
+			const stored = Object.values(
+				(await new ConversationStore<SlackConversation>({ agentDir, kind: "slack" }).load()).conversations,
+			);
+			expect(stored.filter(record => record.state === "active" && record.rootTs)).toEqual([
+				expect.objectContaining({ state: "active", rootTs: "171.300", sessionId: "session" }),
+			]);
+		} finally {
+			await daemon?.stop();
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses a bind that arrives while a stock root publication holds the session claim", async () => {
+		await withDaemon(async (daemon, fake, _injected, _setEndpointGeneration, agentDir) => {
+			fake.seedRoot("C1", "171.301");
+			const releasePost = Promise.withResolvers<void>();
+			fake.postGate = releasePost.promise;
+			const publication = daemon.postRoot("session", "stock root", 1);
+			await fake.waitForPostStartCount(1);
+
+			await expect(daemon.bindExistingRoot("session", "171.301")).rejects.toMatchObject({
+				name: "SlackThreadBindingError",
+				code: "session_conflict",
+			});
+
+			releasePost.resolve();
+			const published = await publication;
+			expect(fake.posts.filter(post => post.threadTs === undefined)).toHaveLength(1);
+			const stored = Object.values(
+				(await new ConversationStore<SlackConversation>({ agentDir, kind: "slack" }).load()).conversations,
+			);
+			expect(stored.filter(record => record.state === "active")).toEqual([
+				expect.objectContaining({ state: "active", rootTs: published.rootTs, sessionId: "session" }),
+			]);
+		});
+	});
+
 	it("acknowledges accepted, rejected, and duplicate envelopes before their outcome", async () => {
 		await withDaemon(async (daemon, fake, injected) => {
 			const root = await daemon.postRoot("session", "root");

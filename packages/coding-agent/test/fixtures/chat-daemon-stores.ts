@@ -8,6 +8,15 @@ export class MemoryConversationStoreFs implements ConversationStoreFs {
 	failRename = false;
 	failFileSync = false;
 	failDirectorySync = false;
+	/** Post-commit lock release failures, injected independently of the mapping commit. */
+	failLockClose = false;
+	failLockUnlink = false;
+	/** Fires at the actual rename entry, before the namespace change linearizes. */
+	onRename?: (from: string, to: string) => void | Promise<void>;
+	/** Fires immediately after the namespace change linearized. */
+	afterRename?: (from: string, to: string) => void | Promise<void>;
+	/** Selective rename failure, so one phase of a multi-phase commit can fail alone. */
+	failRenameWhen?: (from: string, to: string) => boolean;
 
 	async mkdir(directory: string, options: { recursive: true; mode: number }): Promise<void> {
 		this.calls.push(`mkdir:${directory}`);
@@ -36,8 +45,9 @@ export class MemoryConversationStoreFs implements ConversationStoreFs {
 	}
 
 	async rename(from: string, to: string): Promise<void> {
+		await this.onRename?.(from, to);
 		this.calls.push(`rename:${from}:${to}`);
-		if (this.failRename) throw new Error("rename failed");
+		if (this.failRename || this.failRenameWhen?.(from, to) === true) throw new Error("rename failed");
 		const data = this.files.get(from);
 		if (data === undefined) throw new Error(`missing temporary file: ${from}`);
 		this.files.set(to, data);
@@ -45,10 +55,14 @@ export class MemoryConversationStoreFs implements ConversationStoreFs {
 		const mode = this.modes.get(from);
 		if (mode !== undefined) this.modes.set(to, mode);
 		this.modes.delete(from);
+		await this.afterRename?.(from, to);
 	}
 
 	async unlink(file: string): Promise<void> {
 		this.calls.push(`unlink:${file}`);
+		if (this.failLockUnlink && file.endsWith(".lock")) {
+			throw Object.assign(new Error(`EIO: ${file}`), { code: "EIO" });
+		}
 		this.files.delete(file);
 	}
 
@@ -74,6 +88,9 @@ export class MemoryConversationStoreFs implements ConversationStoreFs {
 			writeFile,
 			close: async () => {
 				this.calls.push(`close:${file}`);
+				if (this.failLockClose && file.endsWith(".lock")) {
+					throw Object.assign(new Error(`EIO: ${file}`), { code: "EIO" });
+				}
 			},
 		};
 	}

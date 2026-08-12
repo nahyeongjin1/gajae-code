@@ -24,11 +24,17 @@ import {
 	redactBrokerDiscovery,
 } from "./discovery";
 import { deriveIdempotencyIdentity } from "./identity";
-import { canonicalDeleteLocatorPath, executeLifecycle, isCanonicalSessionId } from "./lifecycle";
+import {
+	canonicalDeleteLocatorPath,
+	executeLifecycle,
+	isCanonicalSessionId,
+	type LifecycleExecutionOutcome,
+} from "./lifecycle";
 
 import {
 	type LifecycleDurableEffectsReceipt,
 	LifecycleLedger,
+	type LifecycleLedgerEntry,
 	type LifecycleStartupFailureReceipt,
 	type LifecycleState,
 } from "./lifecycle-ledger";
@@ -182,6 +188,13 @@ function lifecycleResponseState(response: BrokerResponse): LifecycleState {
 	if (isCleanupPending(response)) return "effect_started";
 	return response.error.code === "terminal_uncertain" ? "terminal_uncertain" : "terminal_error";
 }
+
+/**
+ * The one uncertainty a caller sees when a terminal outcome exists but its durable
+ * evidence cannot be reproduced. It carries no replayable outcome on purpose.
+ */
+const TERMINAL_EVIDENCE_UNVERIFIED =
+	"Lifecycle terminal evidence could not be verified after persistence; retained artifacts require reconciliation.";
 
 type InputNormalization = { input: Record<string, unknown> } | BrokerResponse;
 
@@ -825,6 +838,7 @@ export class Broker {
 			.digest("hex");
 		const identity = await deriveIdempotencyIdentity(this.settings.agentDir, operation, idempotencyKey, target);
 		let reconstructedDeleteCleanup: BrokerCleanupEvidence | undefined;
+		let shorthandDeleteNoOp: BrokerResponse | undefined;
 		if (operation === "session.delete" && input.cwd === undefined && input.sessionPath === undefined) {
 			const entry = this.ledger.get(identity);
 			const cleanup = cleanupFromResponse(entry?.response) ?? cleanupFromResponse(entry?.unresolvedCleanupResponse);
@@ -849,19 +863,40 @@ export class Broker {
 						"Session cleanup authority is pending under another lifecycle identity",
 					);
 				}
+				// No terminal outcome is returned from this pre-normalization shorthand.
+				// The stored row may have been anchored by a full-locator request, and an
+				// in-memory terminal response is never proof that the row was durably
+				// persisted. Falling through applies this minimal request's own hash in
+				// `begin()` — so a full-locator key retried as `{sessionId}` conflicts —
+				// and re-reads the durable terminal row before any outcome is handed back.
 				if (entry) {
-					if (isBrokerResponse(entry.response)) return entry.response;
-					return error("terminal_uncertain", "Existing session.delete ledger evidence lacks replayable authority");
-				}
-				if (requestedSessionId) {
-					await this.index.refresh();
-					if (this.index.listSessions().sessions.some(session => session.sessionId === requestedSessionId))
+					if (
+						entry.state !== "terminal_ok" &&
+						entry.state !== "terminal_error" &&
+						entry.state !== "terminal_uncertain"
+					)
 						return error(
 							"terminal_uncertain",
-							"Indexed session requires durable locator authority before deletion",
+							"Existing session.delete ledger evidence lacks replayable authority",
 						);
+				} else {
+					if (requestedSessionId) {
+						await this.index.refresh();
+						if (this.index.listSessions().sessions.some(session => session.sessionId === requestedSessionId))
+							return error(
+								"terminal_uncertain",
+								"Indexed session requires durable locator authority before deletion",
+							);
+					}
+					// Nothing is owned under this identity and nothing is indexed, so this is
+					// an idempotent no-op. It is still recorded through the normal path so it
+					// is fenced by its own request hash and verified against its durable row
+					// like every other terminal outcome.
+					shorthandDeleteNoOp = {
+						ok: true,
+						result: requestedSessionId ? { sessionId: requestedSessionId } : undefined,
+					};
 				}
-				return { ok: true, result: requestedSessionId ? { sessionId: requestedSessionId } : undefined };
 			}
 			if (
 				cleanup &&
@@ -893,7 +928,20 @@ export class Broker {
 			if (begun.kind === "replay") {
 				const replay = begun.entry.response as BrokerResponse;
 				const cleanup = cleanupFromResponse(replay) ?? reconstructedDeleteCleanup;
-				if (!cleanup) return replay;
+				if (!cleanup) {
+					// A terminal response held only in memory is not proof. The row that
+					// produced it may never have been verified — or may have been verified by
+					// a caller that then failed its own read-back — so every same-key replay
+					// re-reads the durable terminal evidence before handing back an outcome.
+					// A cleanup-owning replay is reconciliation, not a bare replay, and keeps
+					// its own semantics below.
+					if (
+						(begun.entry.state === "terminal_ok" || begun.entry.state === "terminal_error") &&
+						!(await this.#reproducesTerminalEvidence(identity, requestHash, begun.entry))
+					)
+						return error("terminal_uncertain", TERMINAL_EVIDENCE_UNVERIFIED);
+					return replay;
+				}
 				const outcome = await executeLifecycle(this, operation, input, identity, cleanup);
 				const response = outcome.response;
 				await this.ledger.transition(identity, lifecycleResponseState(response), {
@@ -923,7 +971,9 @@ export class Broker {
 				return response;
 			}
 			if (begun.kind === "in_progress") return error("broker_restarting", "lifecycle operation is in progress");
-			const outcome = await executeLifecycle(this, operation, input, identity);
+			const outcome: LifecycleExecutionOutcome = shorthandDeleteNoOp
+				? { response: shorthandDeleteNoOp }
+				: await executeLifecycle(this, operation, input, identity);
 			const response = outcome.response;
 			await this.ledger.transition(identity, lifecycleResponseState(response), {
 				...(pendingCleanupSessionId(response) ? { intendedSessionId: pendingCleanupSessionId(response) } : {}),
@@ -945,17 +995,11 @@ export class Broker {
 				canonicalJson(persisted.durableEffects) === canonicalJson(outcome.durableEffects) &&
 				canonicalJson(persisted.startupFailure) === canonicalJson(outcome.startupFailure);
 			if (!persistenceVerified) {
-				const uncertain = error(
-					"terminal_uncertain",
-					"Lifecycle terminal evidence could not be verified after persistence; retained artifacts require reconciliation.",
-				);
-				await this.ledger.transition(identity, "terminal_uncertain", {
-					response: uncertain,
-					responseDigest: createHash("sha256").update(canonicalJson(uncertain)).digest("hex"),
-					...(outcome.durableEffects ? { durableEffects: outcome.durableEffects } : {}),
-					...(outcome.startupFailure ? { startupFailure: outcome.startupFailure } : {}),
-				});
-				return uncertain;
+				// The transition above already appended this identity's final row, so the
+				// ledger keeps reconciliation ownership. Appending a second final row here
+				// would be an invalid history continuation that a later reopen quarantines,
+				// so the unverified outcome is reported without another durable transition.
+				return error("terminal_uncertain", TERMINAL_EVIDENCE_UNVERIFIED);
 			}
 			terminalPersistenceHooksForTest.get(this)?.();
 			await outcome.deferredArtifactCleanup?.();
@@ -964,6 +1008,32 @@ export class Broker {
 			release();
 			if (this.#chains.get(target) === current) this.#chains.delete(target);
 		}
+	}
+
+	/**
+	 * Re-reads this request's durable terminal row and proves it still reproduces the
+	 * in-memory entry a caller is about to replay.
+	 *
+	 * `readTerminal` re-validates identity, request hash, digests, and history
+	 * continuation against the file itself, so a torn, rewritten, or unreadable
+	 * ledger withholds proof instead of blessing a remembered outcome.
+	 */
+	async #reproducesTerminalEvidence(
+		identity: string,
+		requestHash: string,
+		entry: LifecycleLedgerEntry,
+	): Promise<boolean> {
+		const persisted = await this.ledger.readTerminal(identity, requestHash);
+		return (
+			persisted !== undefined &&
+			persisted.identity === entry.identity &&
+			persisted.requestHash === entry.requestHash &&
+			persisted.state === entry.state &&
+			persisted.responseDigest === entry.responseDigest &&
+			canonicalJson(persisted.response) === canonicalJson(entry.response) &&
+			canonicalJson(persisted.durableEffects) === canonicalJson(entry.durableEffects) &&
+			canonicalJson(persisted.startupFailure) === canonicalJson(entry.startupFailure)
+		);
 	}
 }
 

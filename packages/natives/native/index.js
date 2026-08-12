@@ -26,6 +26,7 @@ export const NotificationServer = nativeBindings.NotificationServer;
 export const Process = nativeBindings.Process;
 export const PtySession = nativeBindings.PtySession;
 export const RecoveryFsRoot = nativeBindings.RecoveryFsRoot;
+export const RetainedCommandDir = nativeBindings.RetainedCommandDir;
 export const Shell = nativeBindings.Shell;
 
 // functions
@@ -73,6 +74,7 @@ export const matchesKittySequence = nativeBindings.matchesKittySequence;
 export const matchesLegacySequence = nativeBindings.matchesLegacySequence;
 export const nativeBuildInfo = nativeBindings.nativeBuildInfo;
 export const openRecoveryFsRoot = nativeBindings.openRecoveryFsRoot;
+export const openRetainedCommandDir = nativeBindings.openRetainedCommandDir;
 export const parseKey = nativeBindings.parseKey;
 export const parseKittySequence = nativeBindings.parseKittySequence;
 export const probeWindowsJobMemory = nativeBindings.probeWindowsJobMemory;

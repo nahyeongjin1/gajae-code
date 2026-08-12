@@ -93,6 +93,17 @@ function socketFromGlobal(url: string): SlackWebSocket {
 }
 
 /**
+ * Slack's Web API rejects JSON bodies for read methods such as conversations.replies
+ * with `invalid_arguments`, so every call is encoded as a form body with undefined
+ * parameters omitted rather than serialized.
+ */
+function formBody(body: Record<string, string | undefined>): string {
+	const parameters = new URLSearchParams();
+	for (const [key, value] of Object.entries(body)) if (value !== undefined) parameters.set(key, value);
+	return parameters.toString();
+}
+
+/**
  * Production Socket Mode and Web API client. It keeps all connection state in
  * memory and deliberately never maintains a Slack cursor.
  */
@@ -201,6 +212,22 @@ export class SlackLiveProvider implements SlackProviderClient {
 		if (fromHistory || !input.threadTs) return fromHistory;
 		const replies = await this.#api("conversations.replies", { channel: input.channel, ts: input.threadTs });
 		return this.#findMessage(replies, input.clientMsgId, input.channel);
+	}
+
+	/**
+	 * Confirm that `ts` addresses a real message in `channel`. Slack answers
+	 * `conversations.replies` with the addressed message first; a timestamp that
+	 * is unknown, deleted, or lives in another channel produces a Web API error
+	 * instead, which surfaces as a `SlackProviderError` the caller treats as an
+	 * unverified root.
+	 */
+	async findMessageByTimestamp(input: { channel: string; ts: string }): Promise<SlackMessageSearchResult | null> {
+		const response = await this.#api("conversations.replies", { channel: input.channel, ts: input.ts, limit: "1" });
+		for (const candidate of messages(response.messages)) {
+			if (string(candidate.ts) !== input.ts) continue;
+			return { channel: string(candidate.channel) ?? input.channel, ts: input.ts, client_msg_id: undefined };
+		}
+		return null;
 	}
 
 	async #connect(generation = this.#lifecycleGeneration): Promise<void> {
@@ -316,8 +343,11 @@ export class SlackLiveProvider implements SlackProviderClient {
 			try {
 				response = await this.#fetch(`${SLACK_API}/${operation}`, {
 					method: "POST",
-					headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json; charset=utf-8" },
-					body: JSON.stringify(body),
+					headers: {
+						Authorization: `Bearer ${token}`,
+						"Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+					},
+					body: formBody(body),
 				});
 			} catch {
 				throw new SlackProviderError("connection", operation);

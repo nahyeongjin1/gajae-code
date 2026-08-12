@@ -440,6 +440,76 @@ export declare class RecoveryFsRoot {
   close(): RecoveryFsResult
 }
 
+/**
+ * A retained chat-daemon command directory.
+ *
+ * The descriptor is the authority. Once captured, replacing, moving, or
+ * symlinking the pathname changes nothing about where this object's operations
+ * land, which is what makes the channel's arbitration objects trustworthy.
+ */
+export declare class RetainedCommandDir {
+  /** Identity of the retained directory descriptor itself. */
+  identity(): RetainedDirResult
+  /**
+   * List the retained directory's own entries, skipping `.` and `..` and the
+   * protocol's own in-flight retirement objects.
+   */
+  list(): RetainedDirResult
+  /** Non-dereferenced identity of one entry, or `not_found`. */
+  statEntry(name: string): RetainedDirResult
+  /**
+   * Create one entry that must not already exist.
+   *
+   * `O_CREAT|O_EXCL` is the channel's arbitration primitive, and `O_NOFOLLOW`
+   * keeps a planted link from redirecting the creation. `exists` is a
+   * definitive loss, never an error.
+   */
+  createExclusive(name: string, data: Uint8Array | undefined | null, mode: number): RetainedDirResult
+  /** Read one owner-only, single-linked regular file without following a link. */
+  readEntry(name: string): RetainedDirResult
+  /**
+   * Replace `to` with `from` atomically, both relative to the retained
+   * directory.
+   *
+   * The replacement participates in the directory's mutation lock, so it can
+   * never install a successor while an identity-bound decision about the same
+   * name is in flight.
+   */
+  renameEntry(from: string, to: string): RetainedDirResult
+  /**
+   * Publish `from` under the absent name `to`; `exists` is a definitive loss.
+   *
+   * The publication participates in the directory's mutation lock for the
+   * same reason the replacement does.
+   */
+  linkEntry(from: string, to: string): RetainedDirResult
+  /**
+   * Remove one entry.
+   *
+   * Without `expected_dev`/`expected_ino` the caller owns the name outright
+   * and the removal is unconditional.
+   *
+   * With them the removal is bound to that exact object. POSIX has no
+   * conditional `unlink`, so this is not a proof followed by a hopeful
+   * `unlinkat`: the entry is proven, then *moved* to a name only this call
+   * can address, then re-proven at that private name, and only then removed.
+   * A replacement that beat the move is put back exactly where it was and
+   * reported as `identity_mismatch`; nothing is ever deleted on its behalf.
+   */
+  unlinkEntry(name: string, expectedDev?: string | undefined | null, expectedIno?: string | undefined | null): RetainedDirResult
+  /**
+   * Flush the retained directory itself so a publication survives a crash.
+   *
+   * A host that refuses the barrier is reported as explicit uncertainty
+   * rather than silently downgraded to success: the namespace change is
+   * applied, but nothing here proves it survives a crash, and only the
+   * caller can decide what an unprovable publication means for its protocol.
+   */
+  syncDir(): RetainedDirResult
+  /** Release the retained descriptor. Later operations report `closed`. */
+  close(): void
+}
+
 /** Persistent brush-core shell session. */
 export declare class Shell {
   /**
@@ -1867,6 +1937,21 @@ export interface NotificationEndpoint {
  */
 export declare function openRecoveryFsRoot(path: string): RecoveryFsRoot
 
+/**
+ * Capture a chat-daemon command directory as a retained descriptor.
+ *
+ * `root` is the caller's own trust root (its agent directory) and is the only
+ * pathname this module resolves; `relative` is the managed suffix beneath it
+ * and is walked component by component without following any link.
+ *
+ * `create` materialises the managed suffix owner-only. Failure is fail-closed:
+ * an untrusted component, a weakened directory that cannot be repaired, a host
+ * that cannot serialize namespace mutations across processes, or a host
+ * without descriptor-relative filesystem authority all raise instead of
+ * downgrading to unserialized or pathname operations.
+ */
+export declare function openRetainedCommandDir(root: string, relative: string, create: boolean, mode: number): RetainedCommandDir
+
 /** Parsed Kitty keyboard protocol sequence result for a Kitty input sequence. */
 export interface ParsedKittyResult {
   /** Primary codepoint associated with the key. */
@@ -2076,6 +2161,29 @@ export interface ReplyEvent {
  * publication.
  */
 export declare function retainBrokerPublication(agentDir: string): NativeRetainedBrokerPublication
+
+/** Non-dereferenced identity of one retained directory or one of its entries. */
+export interface RetainedDirIdentity {
+  dev: string
+  ino: string
+  size: string
+  nlink: string
+  mtimeMs: number
+  mode: number
+  uid: number
+  /** `file`, `directory`, `symlink`, or `other`. */
+  kind: string
+}
+
+/** Fail-closed outcome of one descriptor-relative operation. */
+export interface RetainedDirResult {
+  ok: boolean
+  /** Machine-readable failure category; never a path or a message body. */
+  code?: string
+  identity?: RetainedDirIdentity
+  data?: Uint8Array
+  names?: Array<string>
+}
 
 /** Public status of exact direct retirement. Claims and receipts remain native. */
 export interface RetireIfUnclaimedResult {

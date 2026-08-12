@@ -1,5 +1,20 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
+import * as nodeFs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { isProcessIncarnation, processIncarnation } from "../src/sdk/broker/process-incarnation";
+import {
+	claimScopedEntry,
+	listScopedEntries,
+	openChatDaemonCommandScope,
+	publishScopedJsonExclusive,
+	readScopedJson,
+	scopedEntryAgeMs,
+	scopedEntryExists,
+	scopedEntryIdentity,
+	unlinkScopedEntry,
+	writeScopedJson,
+} from "../src/sdk/bus/chat-daemon-command-scope";
 import { ChatEffectJournal, MAX_TERMINAL_CHAT_EFFECTS } from "../src/sdk/bus/chat-effect-journal";
 import {
 	boundedDedupe,
@@ -197,6 +212,42 @@ describe("ConversationStore", () => {
 		expect((await first.load()).conversations).toEqual({ one: record(1), two: record(1) });
 	});
 
+	test("atomically observes other mappings while claiming a different key", async () => {
+		const fs = new MemoryConversationStoreFs();
+		const first = new ConversationStore<TestConversation>({ agentDir: "/agent", kind: "slack", fs, now: () => 2 });
+		const second = new ConversationStore<TestConversation>({ agentDir: "/agent", kind: "slack", fs, now: () => 2 });
+		const claim = (store: ConversationStore<TestConversation>, key: string) =>
+			store.transactWithSnapshot(key, (current, conversations) => {
+				if (Object.values(conversations).some(candidate => candidate.state === "active")) return current;
+				return record((current?.generation ?? 0) + 1, "active");
+			});
+
+		const claimed = await Promise.all([claim(first, "one"), claim(second, "two")]);
+		expect(claimed.filter(candidate => candidate?.state === "active")).toHaveLength(1);
+		expect(Object.values((await first.load()).conversations)).toHaveLength(1);
+	});
+
+	test("keeps an asynchronous authority fence inside the lock and writes nothing when it fails", async () => {
+		const fs = new MemoryConversationStoreFs();
+		const store = new ConversationStore<TestConversation>({ agentDir: "/agent", kind: "slack", fs, now: () => 2 });
+		const peer = new ConversationStore<TestConversation>({ agentDir: "/agent", kind: "slack", fs, now: () => 2 });
+		let observedDuringFence: TestConversation | undefined;
+
+		const rejected = await store.transactWithSnapshot("mapping", async current => {
+			// Another writer must not be able to interleave while the fence runs.
+			observedDuringFence = await peer.read("mapping");
+			return current;
+		});
+		expect(rejected).toBeUndefined();
+		expect(observedDuringFence).toBeUndefined();
+		expect(Object.values((await store.load()).conversations)).toEqual([]);
+
+		const committed = await store.transactWithSnapshot("mapping", async current =>
+			record((current?.generation ?? 0) + 1, "active"),
+		);
+		expect(committed).toMatchObject({ state: "active", generation: 1 });
+	});
+
 	test("rejects a stale generation and restores persisted mappings after restart", async () => {
 		const fs = new MemoryConversationStoreFs();
 		const initial = new ConversationStore<TestConversation>({ agentDir: "/agent", kind: "slack", fs, now: () => 2 });
@@ -224,14 +275,49 @@ describe("ConversationStore", () => {
 		const fs = new MemoryConversationStoreFs();
 		const store = new ConversationStore<TestConversation>({ agentDir: "/agent", kind: "discord", fs, now: () => 4 });
 		await store.write("mapping", undefined, record(1));
-		fs.failFileSync = true;
-		await expect(store.write("mapping", 1, record(2))).rejects.toThrow("sync failed");
-		fs.failFileSync = false;
+		// Both failures happen before the replacement rename, so the commit is
+		// definitively refused rather than uncertain and the prior document stands.
+		const staged = new TemporarySyncFailureFs();
+		const stagedStore = new ConversationStore<TestConversation>({
+			agentDir: "/agent",
+			kind: "discord",
+			fs: staged,
+			now: () => 4,
+		});
+		await stagedStore.write("mapping", undefined, record(1));
+		staged.armed = true;
+		await expect(stagedStore.write("mapping", 1, record(2))).rejects.toMatchObject({
+			name: "ConversationCommitRefusedError",
+			certainty: "refused",
+		});
+		expect(await stagedStore.read("mapping")).toEqual(record(1));
+
 		fs.failRename = true;
-		await expect(store.write("mapping", 1, record(2))).rejects.toThrow("rename failed");
+		await expect(store.write("mapping", 1, record(2))).rejects.toMatchObject({
+			name: "ConversationCommitRefusedError",
+			certainty: "refused",
+		});
 		expect(await store.read("mapping")).toEqual(record(1));
-		expect(fs.calls.some(call => call.startsWith("sync:/agent/sdk/daemons/discord/conversations.json."))).toBe(true);
+		expect(staged.calls.some(call => call.startsWith("sync:/agent/sdk/daemons/discord/conversations.json."))).toBe(
+			true,
+		);
 	});
+	/** Fails the durability barrier of the staged document only, before any rename. */
+	class TemporarySyncFailureFs extends MemoryConversationStoreFs {
+		armed = false;
+
+		override async open(file: string, flags: string) {
+			const handle = await super.open(file, flags);
+			if (!this.armed || !file.includes("conversations.json.") || !file.endsWith(".tmp")) return handle;
+			return {
+				...handle,
+				sync: async () => {
+					await handle.sync();
+					throw new Error("temporary sync failed");
+				},
+			};
+		}
+	}
 	class DirectoryBarrierFs extends MemoryConversationStoreFs {
 		directoryOpenError?: Error;
 		directorySyncError?: Error;
@@ -300,7 +386,14 @@ describe("ConversationStore", () => {
 				fs,
 				platform: "win32",
 			});
-			await expect(store.write("mapping", undefined, record(1))).rejects.toBe(error);
+			await expect(store.write("mapping", undefined, record(1))).rejects.toMatchObject({
+				name: "ConversationCommitUncertainError",
+				certainty: "uncertain",
+				reason: error,
+			});
+			// The replacement already applied, so the applied document is kept
+			// exactly as written rather than compensated away.
+			expect(await store.read("mapping")).toEqual(record(1));
 			const tempSync = fs.calls.findIndex(call =>
 				call.startsWith("sync:/agent/sdk/daemons/discord/conversations.json."),
 			);
@@ -321,7 +414,14 @@ describe("ConversationStore", () => {
 				fs,
 				platform: "win32",
 			});
-			await expect(store.write("mapping", undefined, record(1))).rejects.toBe(error);
+			await expect(store.write("mapping", undefined, record(1))).rejects.toMatchObject({
+				name: "ConversationCommitUncertainError",
+				certainty: "uncertain",
+				reason: error,
+			});
+			// The replacement already applied, so the applied document is kept
+			// exactly as written rather than compensated away.
+			expect(await store.read("mapping")).toEqual(record(1));
 			const tempSync = fs.calls.findIndex(call =>
 				call.startsWith("sync:/agent/sdk/daemons/discord/conversations.json."),
 			);
@@ -342,7 +442,11 @@ describe("ConversationStore", () => {
 					fs,
 					platform: "linux",
 				});
-				await expect(store.write("mapping", undefined, record(1))).rejects.toBe(error);
+				await expect(store.write("mapping", undefined, record(1))).rejects.toMatchObject({
+					name: "ConversationCommitUncertainError",
+					certainty: "uncertain",
+					reason: error,
+				});
 				const tempSync = fs.calls.findIndex(call =>
 					call.startsWith("sync:/agent/sdk/daemons/discord/conversations.json."),
 				);
@@ -369,7 +473,11 @@ describe("ConversationStore", () => {
 			fs,
 			platform: "win32",
 		});
-		await expect(store.write("mapping", undefined, record(1))).rejects.toBe(error);
+		await expect(store.write("mapping", undefined, record(1))).rejects.toMatchObject({
+			name: "ConversationCommitUncertainError",
+			certainty: "uncertain",
+			reason: error,
+		});
 	});
 
 	test("rejects parent close errors after tolerating supported Windows parent sync errors", async () => {
@@ -384,7 +492,11 @@ describe("ConversationStore", () => {
 			fs,
 			platform: "win32",
 		});
-		await expect(store.write("mapping", undefined, record(1))).rejects.toBe(closeError);
+		await expect(store.write("mapping", undefined, record(1))).rejects.toMatchObject({
+			name: "ConversationCommitUncertainError",
+			certainty: "uncertain",
+			reason: closeError,
+		});
 		expect(fs.calls).toContain("close:/agent/sdk/daemons/discord");
 	});
 	test("aggregates unexpected parent sync and close errors", async () => {
@@ -400,7 +512,9 @@ describe("ConversationStore", () => {
 			platform: "win32",
 		});
 		await expect(store.write("mapping", undefined, record(1))).rejects.toMatchObject({
-			errors: [syncError, closeError],
+			name: "ConversationCommitUncertainError",
+			certainty: "uncertain",
+			reason: { errors: [syncError, closeError] },
 		});
 		const rename = fs.calls.findIndex(call => call.startsWith("rename:"));
 		const parentSync = fs.calls.indexOf("sync:/agent/sdk/daemons/discord");
@@ -507,5 +621,225 @@ describe("ChatEffectJournal", () => {
 		const effects = await journal.list();
 		expect(effects.filter(effect => effect.state !== "terminal")).toHaveLength(130);
 		expect(effects.filter(effect => effect.state === "terminal")).toHaveLength(MAX_TERMINAL_CHAT_EFFECTS);
+	});
+});
+
+describe("chat daemon command scope retained authority", () => {
+	interface ScopeFixture {
+		root: string;
+		agentDir: string;
+		commands: string;
+		retained: string;
+		outside: string;
+		cleanup(): Promise<void>;
+	}
+
+	async function scopeFixture(): Promise<ScopeFixture> {
+		const root = await nodeFs.mkdtemp(path.join(os.tmpdir(), "gjc-command-scope-"));
+		const agentDir = path.join(root, "agent");
+		const daemonDir = path.join(agentDir, "sdk", "daemons", "slack");
+		const outside = path.join(root, "outside");
+		await nodeFs.mkdir(outside, { recursive: true, mode: 0o700 });
+		return {
+			root,
+			agentDir,
+			commands: path.join(daemonDir, "commands"),
+			retained: path.join(daemonDir, "commands-retained"),
+			outside,
+			cleanup: async () => await nodeFs.rm(root, { recursive: true, force: true }),
+		};
+	}
+
+	async function names(directory: string): Promise<string[]> {
+		return (await nodeFs.readdir(directory).catch(() => [] as string[])).sort();
+	}
+
+	/**
+	 * Move the real command directory aside and put `replacement` at its pathname.
+	 * Everything the scope does afterwards must still reach the moved directory.
+	 */
+	async function replacePathname(fixture: ScopeFixture, replacement: "symlink" | "directory"): Promise<void> {
+		await nodeFs.rename(fixture.commands, fixture.retained);
+		if (replacement === "symlink") await nodeFs.symlink(fixture.outside, fixture.commands, "dir");
+		else await nodeFs.mkdir(fixture.commands, { mode: 0o700 });
+	}
+
+	const ENTRY = "00000000-0000-0000-0000-000000000000.response.json";
+	const OTHER = "00000000-0000-0000-0000-000000000001.response.json";
+
+	for (const replacement of ["symlink", "directory"] as const) {
+		test(`every operation stays on the retained directory after the pathname becomes a ${replacement}`, async () => {
+			const fixture = await scopeFixture();
+			try {
+				const scope = await openChatDaemonCommandScope({ agentDir: fixture.agentDir, kind: "slack", create: true });
+				expect(scope).toBeDefined();
+				await replacePathname(fixture, replacement);
+
+				expect(await claimScopedEntry(scope!, ENTRY)).toBe(true);
+				expect(await claimScopedEntry(scope!, ENTRY)).toBe(false);
+				await writeScopedJson(scope!, ENTRY, { marker: "retained" });
+				expect(await readScopedJson(scope!, ENTRY)).toEqual({ marker: "retained" });
+				expect(await scopedEntryExists(scope!, ENTRY)).toBe(true);
+				expect(await listScopedEntries(scope!)).toContain(ENTRY);
+				expect(await publishScopedJsonExclusive(scope!, OTHER, { marker: "published" })).toBe("published");
+				expect(await publishScopedJsonExclusive(scope!, OTHER, { marker: "again" })).toBe("exists");
+				expect(await scopedEntryAgeMs(scope!, ENTRY, Date.now())).toBeGreaterThanOrEqual(0);
+				expect(await unlinkScopedEntry(scope!, OTHER)).toBe("removed");
+				expect(await scopedEntryExists(scope!, OTHER)).toBe(false);
+
+				// The retained identity absorbed every operation, and neither the
+				// replacement pathname nor the external directory was ever touched.
+				expect(await names(fixture.retained)).toEqual([ENTRY]);
+				expect(await names(fixture.outside)).toEqual([]);
+				if (replacement === "directory") expect(await names(fixture.commands)).toEqual([]);
+			} finally {
+				await fixture.cleanup();
+			}
+		});
+	}
+
+	test("no pathname recheck seam remains between authority capture and the operation", async () => {
+		const fixture = await scopeFixture();
+		const realLstat: (target: unknown, options: unknown) => Promise<unknown> = (target, options) =>
+			(nodeFs.lstat as unknown as (t: unknown, o: unknown) => Promise<unknown>)(target, options);
+		let lstat: ReturnType<typeof vi.spyOn> | undefined;
+		let swaps = 0;
+		try {
+			const scope = await openChatDaemonCommandScope({ agentDir: fixture.agentDir, kind: "slack", create: true });
+			expect(scope).toBeDefined();
+			// Arm a deterministic replacement barrier at the classic recheck seam: the
+			// instant anything re-reads the command directory *by pathname*, the
+			// pathname stops describing the retained directory. A `lstat` recheck
+			// followed by an ordinary pathname syscall therefore escapes here.
+			const barrier = async (target: unknown, options: unknown): Promise<unknown> => {
+				const observed = await realLstat(target, options);
+				if (String(target) === fixture.commands && swaps === 0) {
+					swaps++;
+					await nodeFs.rename(fixture.commands, fixture.retained);
+					await nodeFs.symlink(fixture.outside, fixture.commands, "dir");
+				}
+				return observed;
+			};
+			lstat = vi.spyOn(nodeFs, "lstat").mockImplementation(barrier as unknown as typeof nodeFs.lstat);
+			await claimScopedEntry(scope!, ENTRY).catch(() => undefined);
+			lstat.mockRestore();
+			lstat = undefined;
+			// Retained authority does not re-resolve the pathname at all, so the
+			// barrier never fires and nothing can be redirected outside the root.
+			expect(swaps).toBe(0);
+			expect(await names(fixture.outside)).toEqual([]);
+		} finally {
+			lstat?.mockRestore();
+			await fixture.cleanup();
+		}
+	});
+
+	test("a planted symlink, directory, or hard link under an entry name is never read or claimed", async () => {
+		const fixture = await scopeFixture();
+		try {
+			const scope = await openChatDaemonCommandScope({ agentDir: fixture.agentDir, kind: "slack", create: true });
+			expect(scope).toBeDefined();
+			const secret = path.join(fixture.outside, "secret.json");
+			await nodeFs.writeFile(secret, `${JSON.stringify({ stolen: true })}\n`, { mode: 0o600 });
+
+			await nodeFs.symlink(secret, path.join(fixture.commands, ENTRY));
+			expect(await readScopedJson(scope!, ENTRY)).toBeUndefined();
+			expect(await claimScopedEntry(scope!, ENTRY)).toBe(false);
+			await unlinkScopedEntry(scope!, ENTRY);
+
+			await nodeFs.mkdir(path.join(fixture.commands, ENTRY), { mode: 0o700 });
+			expect(await readScopedJson(scope!, ENTRY)).toBeUndefined();
+			await nodeFs.rmdir(path.join(fixture.commands, ENTRY));
+
+			await nodeFs.link(secret, path.join(fixture.commands, ENTRY));
+			expect(await readScopedJson(scope!, ENTRY)).toBeUndefined();
+			await nodeFs.unlink(path.join(fixture.commands, ENTRY));
+
+			await nodeFs.writeFile(path.join(fixture.commands, ENTRY), `${JSON.stringify({ loose: true })}\n`, {
+				mode: 0o644,
+			});
+			expect(await readScopedJson(scope!, ENTRY)).toBeUndefined();
+		} finally {
+			await fixture.cleanup();
+		}
+	});
+
+	test("a group-writable command directory is repaired or refused, never used as captured", async () => {
+		const fixture = await scopeFixture();
+		try {
+			expect(
+				await openChatDaemonCommandScope({ agentDir: fixture.agentDir, kind: "slack", create: true }),
+			).toBeDefined();
+			await nodeFs.chmod(fixture.commands, 0o777);
+			const scope = await openChatDaemonCommandScope({ agentDir: fixture.agentDir, kind: "slack" });
+			expect(scope).toBeDefined();
+			expect((await nodeFs.lstat(fixture.commands)).mode & 0o077).toBe(0);
+		} finally {
+			await fixture.cleanup();
+		}
+	});
+
+	test("an unsupported host fails closed instead of downgrading to pathname operations", async () => {
+		const fixture = await scopeFixture();
+		try {
+			expect(
+				await openChatDaemonCommandScope({
+					agentDir: fixture.agentDir,
+					kind: "slack",
+					create: true,
+					platform: "win32",
+				}),
+			).toBeUndefined();
+			expect(await names(fixture.root)).toEqual(["outside"]);
+		} finally {
+			await fixture.cleanup();
+		}
+	});
+
+	test("an identity-bound removal defers to a successor that took the same name", async () => {
+		const fixture = await scopeFixture();
+		try {
+			const scope = await openChatDaemonCommandScope({ agentDir: fixture.agentDir, kind: "slack", create: true });
+			expect(scope).toBeDefined();
+			await writeScopedJson(scope!, ENTRY, { outcome: "ok" });
+			const decided = await scopedEntryIdentity(scope!, ENTRY);
+			expect(decided).toBeDefined();
+
+			// A successor takes the same name after the sweep decided about the
+			// object it read, which is exactly what a retained terminal settlement
+			// republished under the same identifier looks like.
+			await writeScopedJson(scope!, ENTRY, { outcome: "rejected" });
+			const successor = await scopedEntryIdentity(scope!, ENTRY);
+			expect(successor!.ino).not.toBe(decided!.ino);
+
+			expect(await unlinkScopedEntry(scope!, ENTRY, decided)).toBe("identity_mismatch");
+			// The successor survives with its replay authority intact, so no
+			// same-identifier redispatch becomes possible.
+			expect(await scopedEntryExists(scope!, ENTRY)).toBe(true);
+			expect(await readScopedJson(scope!, ENTRY)).toEqual({ outcome: "rejected" });
+			expect(await scopedEntryIdentity(scope!, ENTRY)).toMatchObject({ ino: successor!.ino });
+
+			// The exact object the decision was about is still retirable.
+			expect(await unlinkScopedEntry(scope!, ENTRY, successor)).toBe("removed");
+			expect(await scopedEntryExists(scope!, ENTRY)).toBe(false);
+			expect(await unlinkScopedEntry(scope!, ENTRY, successor)).toBe("absent");
+		} finally {
+			await fixture.cleanup();
+		}
+	});
+
+	test("the protocol leaves no addressable residue behind an identity-bound removal", async () => {
+		const fixture = await scopeFixture();
+		try {
+			const scope = await openChatDaemonCommandScope({ agentDir: fixture.agentDir, kind: "slack", create: true });
+			expect(scope).toBeDefined();
+			await writeScopedJson(scope!, ENTRY, { outcome: "ok" });
+			const decided = await scopedEntryIdentity(scope!, ENTRY);
+			expect(await unlinkScopedEntry(scope!, ENTRY, decided)).toBe("removed");
+			expect(await listScopedEntries(scope!)).toEqual([]);
+			expect(await names(fixture.commands)).toEqual([]);
+		} finally {
+			await fixture.cleanup();
+		}
 	});
 });

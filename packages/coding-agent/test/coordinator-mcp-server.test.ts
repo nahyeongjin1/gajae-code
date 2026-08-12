@@ -30,6 +30,7 @@ import {
 	createFixtureBrokerEnvironment,
 	createFixtureRootCleanup,
 } from "./helpers/fixture-broker-cleanup";
+import { settleFixtureBrokerWithOwner } from "./helpers/owned-children";
 
 const tempDirs: string[] = [];
 
@@ -69,6 +70,10 @@ type SdkControlServerOptions = {
 	controlResult?: (control: SdkControl) => unknown;
 	promptAckTimeoutMs?: number;
 	controlOptions?: Array<{ idempotencyKey?: string; timeoutMs?: number }>;
+	/** Raw session frames (activation) observed on the fake SDK transport. */
+	sdkFrames?: Array<Record<string, unknown>>;
+	/** Answer for a raw session frame; defaults to a single successful activation. */
+	sdkFrameResult?: (frame: Record<string, unknown>, attempt: number) => unknown;
 };
 function lifecycleControls(controls: SdkControl[]): SdkControl[] {
 	return controls.filter(
@@ -145,13 +150,14 @@ function createBrokerTestServer(root: string, services: BrokerTestServices) {
 		services: { ...services, getAgentDir: () => path.join(root, "agent-global") },
 	});
 }
-function createRealBrokerServer(root: string, agentDir: string) {
+function createRealBrokerServer(root: string, agentDir: string, env: NodeJS.ProcessEnv = {}) {
 	return createCoordinatorMcpServer({
 		env: {
 			GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
 			GJC_COORDINATOR_MCP_STATE_ROOT: path.join(root, ".gjc", "coordinator-state"),
 			GJC_COORDINATOR_MCP_PROFILE: "local",
 			GJC_COORDINATOR_MCP_REPO: "repo",
+			...env,
 		},
 		services: { getAgentDir: () => agentDir },
 	});
@@ -200,6 +206,7 @@ async function createSdkControlServer(
 	const stateRoot = path.join(root, ".gjc", "coordinator-state");
 	const agentDir = path.join(root, "agent-global");
 	let createdSessions = 0;
+	let sdkFrameAttempts = 0;
 	const server = createCoordinatorMcpServer({
 		env: {
 			GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
@@ -219,6 +226,19 @@ async function createSdkControlServer(
 			canonicalizePath: serverOptions.canonicalizePath,
 			connectSdk: async () =>
 				({
+					request: async (frame: Record<string, unknown>) => {
+						serverOptions.sdkFrames?.push(frame);
+						sdkFrameAttempts += 1;
+						return (
+							serverOptions.sdkFrameResult?.(frame, sdkFrameAttempts) ?? {
+								type: "session_activate_result",
+								ok: true,
+								status: sdkFrameAttempts === 1 ? "activated" : "already",
+								sessionId: frame.sessionId,
+								generation: frame.endpointGeneration,
+							}
+						);
+					},
 					control: async (
 						operation: string,
 						input: Record<string, unknown>,
@@ -292,6 +312,7 @@ async function createSdkControlServer(
 												},
 											}
 										: {}),
+									...(input.readiness === "deferred" ? { readiness: "prepared" } : {}),
 									endpoint: {
 										url: "ws://broker.example.test/new?token=created-endpoint-secret",
 										token: "Bearer created-endpoint-secret",
@@ -421,6 +442,432 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			"session.list",
 			"session.get_endpoint",
 		]);
+	});
+
+	/**
+	 * Preparation is the first half of the deterministic prepare → bind →
+	 * activate sequence. The Coordinator returns the exact session id and
+	 * endpoint authority while the session is explicitly not ready for input, so
+	 * `gjc notify bind-thread` has a stable target and no root has been claimed.
+	 */
+	it("prepares an existing-thread session as durable, idempotent, and not ready for input", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		const args = {
+			cwd: root,
+			prepare_existing_thread: true,
+			idempotency_key: "prepare-existing-thread",
+			allow_mutation: true,
+		};
+
+		const prepared = await server.callTool("gjc_coordinator_start_session", args);
+
+		expect(prepared).toMatchObject({
+			ok: true,
+			session_id: "created-session-1",
+			state: "prepared",
+			session: { session_id: "created-session-1" },
+			session_state: { state: "prepared", ready_for_input: false },
+		});
+		expect(await server.callTool("gjc_coordinator_start_session", args)).toEqual(prepared);
+		const creates = controls.filter(control => control.operation === "session.create");
+		expect(creates).toHaveLength(1);
+		expect(creates[0]?.input).toMatchObject({ readiness: "deferred" });
+		expect(controls.some(control => control.operation.startsWith("turn."))).toBe(false);
+	});
+
+	it("refuses an initial prompt for a prepared session before any broker mutation", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+
+		expect(
+			await server.callTool("gjc_coordinator_start_session", {
+				cwd: root,
+				prepare_existing_thread: true,
+				prompt: "do the thing",
+				idempotency_key: "prepare-with-prompt",
+				allow_mutation: true,
+			}),
+		).toMatchObject({
+			ok: false,
+			error: { code: "invalid_input" },
+		});
+		expect(controls).toEqual([]);
+	});
+
+	/**
+	 * Activation is the only transition out of `prepared`, and it may only be
+	 * recorded once the session itself has proven it. The request names the exact
+	 * session and endpoint generation, so a replacement session can never be
+	 * activated in place of the requested one, and an exact replay settles
+	 * without a second activation frame.
+	 */
+	it("activates a prepared session on proven activation and replays idempotently", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const frames: Array<Record<string, unknown>> = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			sdkFrames: frames,
+		});
+		const prepared = (await server.callTool("gjc_coordinator_start_session", {
+			cwd: root,
+			prepare_existing_thread: true,
+			idempotency_key: "prepare-then-activate",
+			allow_mutation: true,
+		})) as { session_id: string };
+
+		const activateArgs = {
+			session_id: prepared.session_id,
+			idempotency_key: "activate-once",
+			allow_mutation: true,
+		};
+		const activated = await server.callTool("gjc_coordinator_activate_session", activateArgs);
+
+		expect(activated).toMatchObject({
+			ok: true,
+			session_id: prepared.session_id,
+			status: "activated",
+			state: "ready_for_input",
+			session_state: { state: "ready_for_input", ready_for_input: true },
+		});
+		expect(frames).toEqual([{ type: "session_activate", sessionId: prepared.session_id, endpointGeneration: 1 }]);
+		expect(await server.callTool("gjc_coordinator_activate_session", activateArgs)).toEqual(activated);
+		expect(frames).toHaveLength(1);
+	});
+
+	it("leaves a session prepared when the session refuses the activation", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const frames: Array<Record<string, unknown>> = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			sdkFrames: frames,
+			sdkFrameResult: () => {
+				throw new SdkClientError("not_authorized", "no binding has been applied");
+			},
+		});
+		const prepared = (await server.callTool("gjc_coordinator_start_session", {
+			cwd: root,
+			prepare_existing_thread: true,
+			idempotency_key: "prepare-unbound",
+			allow_mutation: true,
+		})) as { session_id: string };
+
+		expect(
+			await server.callTool("gjc_coordinator_activate_session", {
+				session_id: prepared.session_id,
+				idempotency_key: "activate-unbound",
+				allow_mutation: true,
+			}),
+		).toMatchObject({ ok: false, error: { code: "not_bound" }, state: "prepared" });
+		expect(await server.callTool("gjc_coordinator_read_status", { session_id: prepared.session_id })).toMatchObject({
+			session_state: { state: "prepared", ready_for_input: false },
+		});
+	});
+
+	/**
+	 * A prepared session whose host applies the activation exactly once. The
+	 * answer to the first `unansweredAttempts` requests is lost in flight or
+	 * arrives unable to prove the request, which is precisely the state an
+	 * `activation_outcome_unknown` reports: readiness may already be published.
+	 */
+	function preparedActivationEndpoint(options: { unansweredAttempts: number; failure?: "lost" | "corrupt" }) {
+		const activations: Array<Record<string, unknown>> = [];
+		const readiness: string[] = [];
+		let unanswered = 0;
+		return {
+			activations,
+			readiness,
+			sdkFrameResult: (frame: Record<string, unknown>) => {
+				if (frame.type !== "session_activate") return { ok: true };
+				const first = readiness.length === 0;
+				if (first) readiness.push(String(frame.sessionId));
+				const settled = {
+					type: "session_activate_result",
+					ok: true,
+					status: first ? "activated" : "already",
+					sessionId: frame.sessionId,
+					generation: frame.endpointGeneration,
+				};
+				if (unanswered >= options.unansweredAttempts) return settled;
+				unanswered += 1;
+				if (options.failure === "corrupt") return { ...settled, sessionId: "replacement-session" };
+				throw new SdkClientError("connection_closed", "activation answer lost in flight");
+			},
+		};
+	}
+
+	async function preparedActivationServer(
+		root: string,
+		endpoint: {
+			activations: Array<Record<string, unknown>>;
+			sdkFrameResult: (frame: Record<string, unknown>) => unknown;
+		},
+		sessions = 1,
+	) {
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			sdkFrames: endpoint.activations,
+			sdkFrameResult: endpoint.sdkFrameResult,
+		});
+		const sessionIds: string[] = [];
+		for (let index = 1; index <= sessions; index++) {
+			const prepared = (await server.callTool("gjc_coordinator_start_session", {
+				cwd: root,
+				prepare_existing_thread: true,
+				idempotency_key: `prepare-for-activation-${index}`,
+				allow_mutation: true,
+			})) as { session_id: string };
+			sessionIds.push(prepared.session_id);
+		}
+		return { server, controls, sessionIds, sessionId: sessionIds[0] as string };
+	}
+
+	/** Durable `session.started` evidence written only by a settled activation. */
+	async function activationStartEvidence(root: string, sessionId: string): Promise<Array<Record<string, unknown>>> {
+		const journal = path.join(root, ".gjc", "coordinator-state", "local", "repo", "events", "event-journal.jsonl");
+		const content = await fs.readFile(journal, "utf8").catch(() => "");
+		return content
+			.split("\n")
+			.filter(line => line.trim().length > 0)
+			.map(line => JSON.parse(line) as Record<string, unknown>)
+			.filter(
+				event =>
+					event.kind === "session.started" &&
+					event.session_id === sessionId &&
+					(event.metadata as Record<string, unknown> | undefined)?.status !== undefined,
+			);
+	}
+
+	function activateArgsFor(sessionId: string, idempotencyKey: string): Record<string, unknown> {
+		return { session_id: sessionId, idempotency_key: idempotencyKey, allow_mutation: true };
+	}
+
+	for (const failure of ["lost", "corrupt"] as const) {
+		/**
+		 * The unknown outcome is the honest answer to the first caller, and it must
+		 * stay honest: durable state is still `prepared`, no readiness transition
+		 * was recorded, and no start evidence was written.
+		 */
+		it(`reports a nonterminal unknown outcome and leaves the session prepared when the answer is ${failure}`, async () => {
+			const root = await tempRoot();
+			const endpoint = preparedActivationEndpoint({ unansweredAttempts: 1, failure });
+			const { server, sessionId } = await preparedActivationServer(root, endpoint);
+
+			expect(
+				await server.callTool("gjc_coordinator_activate_session", activateArgsFor(sessionId, "activate-unknown")),
+			).toMatchObject({ ok: false, error: { code: "activation_outcome_unknown" }, state: "prepared" });
+			expect(await server.callTool("gjc_coordinator_read_status", { session_id: sessionId })).toMatchObject({
+				session_state: { state: "prepared", ready_for_input: false },
+			});
+			expect(endpoint.activations).toHaveLength(1);
+			expect(await activationStartEvidence(root, sessionId)).toEqual([]);
+		});
+
+		/**
+		 * The whole point of the unknown outcome: the host may already have applied
+		 * the activation, so the same key must be able to observe the settled state
+		 * instead of replaying the uncertainty forever.
+		 */
+		it(`re-runs the exact activation on a same-key retry after an ${failure} answer and settles as already`, async () => {
+			const root = await tempRoot();
+			const endpoint = preparedActivationEndpoint({ unansweredAttempts: 1, failure });
+			const { server, sessionId } = await preparedActivationServer(root, endpoint);
+			const args = activateArgsFor(sessionId, "activate-retry-after-unknown");
+
+			expect(await server.callTool("gjc_coordinator_activate_session", args)).toMatchObject({
+				ok: false,
+				error: { code: "activation_outcome_unknown" },
+			});
+
+			const retried = await server.callTool("gjc_coordinator_activate_session", args);
+
+			expect(retried).toMatchObject({
+				ok: true,
+				session_id: sessionId,
+				status: "already",
+				state: "ready_for_input",
+				session_state: { state: "ready_for_input", ready_for_input: true },
+			});
+			expect(endpoint.activations).toEqual([
+				{ type: "session_activate", sessionId, endpointGeneration: 1 },
+				{ type: "session_activate", sessionId, endpointGeneration: 1 },
+			]);
+			// The host published readiness once; the retry only observed it.
+			expect(endpoint.readiness).toEqual([sessionId]);
+			expect(await activationStartEvidence(root, sessionId)).toHaveLength(1);
+
+			// The settled receipt is now terminal: a further exact retry replays it.
+			expect(await server.callTool("gjc_coordinator_activate_session", args)).toEqual(retried);
+			expect(endpoint.activations).toHaveLength(2);
+		});
+	}
+
+	it("keeps a repeatedly unknown activation retryable until a settled answer closes the receipt", async () => {
+		const root = await tempRoot();
+		const endpoint = preparedActivationEndpoint({ unansweredAttempts: 2, failure: "lost" });
+		const { server, sessionId } = await preparedActivationServer(root, endpoint);
+		const args = activateArgsFor(sessionId, "activate-repeated-unknown");
+
+		for (const attempt of [1, 2]) {
+			expect(await server.callTool("gjc_coordinator_activate_session", args)).toMatchObject({
+				ok: false,
+				error: { code: "activation_outcome_unknown" },
+				state: "prepared",
+			});
+			expect(endpoint.activations).toHaveLength(attempt);
+		}
+
+		const settled = await server.callTool("gjc_coordinator_activate_session", args);
+
+		expect(settled).toMatchObject({ ok: true, status: "already", state: "ready_for_input" });
+		expect(endpoint.activations).toHaveLength(3);
+		expect(endpoint.readiness).toEqual([sessionId]);
+		expect(await server.callTool("gjc_coordinator_activate_session", args)).toEqual(settled);
+		expect(endpoint.activations).toHaveLength(3);
+	});
+
+	/**
+	 * A refusal the session decided is settled evidence, not uncertainty: it stays
+	 * a terminal replay, and a same-key retry sends no second activation frame.
+	 */
+	it("replays a deterministic not_bound refusal without a second activation attempt", async () => {
+		const root = await tempRoot();
+		const activations: Array<Record<string, unknown>> = [];
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			sdkFrames: activations,
+			sdkFrameResult: () => {
+				throw new SdkClientError("not_authorized", "no binding has been applied");
+			},
+		});
+		const prepared = (await server.callTool("gjc_coordinator_start_session", {
+			cwd: root,
+			prepare_existing_thread: true,
+			idempotency_key: "prepare-not-bound",
+			allow_mutation: true,
+		})) as { session_id: string };
+		const args = activateArgsFor(prepared.session_id, "activate-not-bound");
+
+		const refused = await server.callTool("gjc_coordinator_activate_session", args);
+
+		expect(refused).toMatchObject({ ok: false, error: { code: "not_bound" }, state: "prepared" });
+		expect(await server.callTool("gjc_coordinator_activate_session", args)).toEqual(refused);
+		expect(activations).toHaveLength(1);
+	});
+
+	it("still refuses a reused activation key that names a different session after an unknown outcome", async () => {
+		const root = await tempRoot();
+		const endpoint = preparedActivationEndpoint({ unansweredAttempts: 1, failure: "lost" });
+		const { server, sessionIds } = await preparedActivationServer(root, endpoint, 2);
+		const key = "activate-shared-key";
+
+		expect(
+			await server.callTool("gjc_coordinator_activate_session", activateArgsFor(sessionIds[0] as string, key)),
+		).toMatchObject({ ok: false, error: { code: "activation_outcome_unknown" } });
+
+		expect(
+			await server.callTool("gjc_coordinator_activate_session", activateArgsFor(sessionIds[1] as string, key)),
+		).toMatchObject({ ok: false, error: { code: "idempotency_conflict" } });
+		expect(endpoint.activations).toHaveLength(1);
+	});
+
+	it("recovers a crash-left in-progress activation receipt under the same idempotency key", async () => {
+		const root = await tempRoot();
+		const endpoint = preparedActivationEndpoint({ unansweredAttempts: 0 });
+		const { server, sessionId } = await preparedActivationServer(root, endpoint);
+		const idempotencyKey = "activate-after-crash";
+		const keyDigest = createHash("sha256").update(idempotencyKey).digest("hex");
+		const requestDigest = createHash("sha256")
+			.update(
+				`{"args":{"allow_mutation":true,"session_id":${JSON.stringify(sessionId)}},"tool":"gjc_coordinator_activate_session"}`,
+			)
+			.digest("hex");
+		const receipt = path.join(root, ".gjc", "coordinator-state", "local", "repo", "idempotency", `${keyDigest}.json`);
+		await fs.mkdir(path.dirname(receipt), { recursive: true });
+		await fs.writeFile(
+			receipt,
+			`${JSON.stringify({
+				schema_version: 1,
+				tool: "gjc_coordinator_activate_session",
+				key_digest: keyDigest,
+				request_digest: requestDigest,
+				state: "in_progress",
+				created_at: new Date().toISOString(),
+			})}\n`,
+		);
+
+		expect(
+			await server.callTool("gjc_coordinator_activate_session", activateArgsFor(sessionId, idempotencyKey)),
+		).toMatchObject({ ok: true, status: "activated", state: "ready_for_input" });
+		expect(endpoint.activations).toHaveLength(1);
+		expect(endpoint.readiness).toEqual([sessionId]);
+		expect(await activationStartEvidence(root, sessionId)).toHaveLength(1);
+	});
+
+	it("serializes concurrent same-key activation retries into one transition", async () => {
+		const root = await tempRoot();
+		const endpoint = preparedActivationEndpoint({ unansweredAttempts: 1, failure: "lost" });
+		const { server, sessionId } = await preparedActivationServer(root, endpoint);
+		const args = activateArgsFor(sessionId, "activate-concurrent-retry");
+
+		expect(await server.callTool("gjc_coordinator_activate_session", args)).toMatchObject({
+			ok: false,
+			error: { code: "activation_outcome_unknown" },
+		});
+
+		const [first, second] = await Promise.all([
+			server.callTool("gjc_coordinator_activate_session", args),
+			server.callTool("gjc_coordinator_activate_session", args),
+		]);
+
+		expect(first).toEqual(second);
+		expect(first).toMatchObject({ ok: true, status: "already", state: "ready_for_input" });
+		expect(endpoint.activations).toHaveLength(2);
+		expect(endpoint.readiness).toEqual([sessionId]);
+		expect(await activationStartEvidence(root, sessionId)).toHaveLength(1);
+	});
+
+	it("refuses send_prompt while a session is prepared and accepts it after activation", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const frames: Array<Record<string, unknown>> = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			sdkFrames: frames,
+		});
+		const prepared = (await server.callTool("gjc_coordinator_start_session", {
+			cwd: root,
+			prepare_existing_thread: true,
+			idempotency_key: "prepare-before-prompt",
+			allow_mutation: true,
+		})) as { session_id: string };
+
+		expect(
+			await server.callTool("gjc_coordinator_send_prompt", {
+				session_id: prepared.session_id,
+				prompt: "too early",
+				idempotency_key: "prompt-before-activation",
+				allow_mutation: true,
+			}),
+		).toMatchObject({ ok: false, error: { code: "session_not_activated" } });
+		expect(controls.some(control => control.operation.startsWith("turn."))).toBe(false);
+
+		await server.callTool("gjc_coordinator_activate_session", {
+			session_id: prepared.session_id,
+			idempotency_key: "activate-before-prompt",
+			allow_mutation: true,
+		});
+
+		expect(
+			await server.callTool("gjc_coordinator_send_prompt", {
+				session_id: prepared.session_id,
+				prompt: "now it is live",
+				idempotency_key: "prompt-after-activation",
+				allow_mutation: true,
+			}),
+		).toMatchObject({ ok: true, operation: "turn.prompt" });
+		expect(controls.filter(control => control.operation === "turn.prompt")).toHaveLength(1);
 	});
 
 	it("preserves multiline delegated task text in one SDK turn.prompt control", async () => {
@@ -1651,26 +2098,33 @@ describe("Coordinator MCP canonical SDK controls", () => {
 	});
 
 	it("returns SDK failures rather than falling back outside SDK control", async () => {
-		const root = await tempRoot();
-		const server = createCoordinatorMcpServer({
-			env: {
-				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
-				GJC_COORDINATOR_MCP_STATE_ROOT: path.join(root, ".gjc", "coordinator-state"),
-				GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
-				GJC_COORDINATOR_MCP_PROFILE: "local",
-				GJC_COORDINATOR_MCP_REPO: "repo",
-			},
-		});
-		await registerSdkSession(server, root);
-		expect(
-			await server.callTool("gjc_coordinator_send_prompt", {
-				session_id: "visible-session",
-				prompt: "work",
-				idempotency_key: "key-1",
-				allow_mutation: true,
-			}),
-		).toMatchObject({ ok: false, error: { code: "not_found" } });
-	});
+		const root = await managedFixtureRoot();
+		const agentDir = path.join(root, "agent-global");
+		const cleanup = createFixtureRootCleanup(root, agentDir, ownerLease(agentDir));
+		try {
+			const server = createRealBrokerServer(root, agentDir, { GJC_COORDINATOR_MCP_MUTATIONS: "sessions" });
+			await registerSdkSession(server, root);
+			expect(
+				await server.callTool("gjc_coordinator_send_prompt", {
+					session_id: "visible-session",
+					prompt: "work",
+					idempotency_key: "key-1",
+					allow_mutation: true,
+				}),
+			).toMatchObject({ ok: false, error: { code: "not_found" } });
+		} finally {
+			// This call reaches real SDK control, so it launches a real broker. The
+			// broker's identity is captured before cleanup removes the record that
+			// names it, and cleanup is only proven when that exact process is gone —
+			// deleting the directory settles nothing.
+			const settled = await settleFixtureBrokerWithOwner(agentDir, {
+				launched: true,
+				owner: () => cleanupFixtureRoot(cleanup),
+			});
+			expect(settled).toEqual({ problem: undefined, failures: [] });
+			expect(brokerOwnerForTest(agentDir)).toBeUndefined();
+		}
+	}, 15_000);
 
 	it("keeps coordinator metadata reports and event journals available without turning them into control authority", async () => {
 		const root = await tempRoot();
